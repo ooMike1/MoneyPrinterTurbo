@@ -7,6 +7,7 @@ import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from functools import partial
 from os import path
+from typing import List
 from uuid import uuid4
 
 from loguru import logger
@@ -455,6 +456,17 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
+def source_supports_paragraph_mode(source: str) -> bool:
+    """Returns True if the video source supports per-paragraph clip matching."""
+    return source in ("auto", "pexels", "pixabay", "coverr")
+
+
+def _split_script_into_paragraphs(script: str) -> List[str]:
+    """Split a video script into paragraphs by double newlines."""
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", script.strip())]
+    return [p for p in paragraphs if p]
+
+
 def get_video_materials(task_id, params, video_terms, audio_duration):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
@@ -471,22 +483,82 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return [material_info.url for material_info in materials]
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
-        # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
-        # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
-        downloaded_videos = material.download_videos(
-            task_id=task_id,
-            search_terms=video_terms,
-            source=params.video_source,
-            video_aspect=params.video_aspect,
-            video_concat_mode=(
-                VideoConcatMode.sequential
-                if params.match_materials_to_script
-                else params.video_concat_mode
-            ),
-            audio_duration=audio_duration * params.video_count,
-            max_clip_duration=params.video_clip_duration,
-            match_script_order=params.match_materials_to_script,
+        use_comfyui_fallback = (
+            params.video_source in ("auto", "pexels", "pixabay", "coverr")
+            and config.comfyui
+            and bool(config.comfyui.get("base_url", ""))
+            and config.app.get("comfyui_fallback_enabled", True)
         )
+
+        video_script = params.video_script
+        if not video_script:
+            script_file = path.join(utils.task_dir(task_id), "script.json")
+            if os.path.exists(script_file):
+                try:
+                    import json
+                    with open(script_file, "r", encoding="utf-8") as f:
+                        script_data = json.load(f)
+                        video_script = script_data.get("script", "")
+                except Exception:
+                    pass
+
+        should_match_paragraphs = (
+            params.match_materials_to_script
+            and video_script
+            and source_supports_paragraph_mode(params.video_source)
+        )
+
+        if should_match_paragraphs:
+            paragraphs = _split_script_into_paragraphs(video_script)
+            logger.info(
+                f"script has {len(paragraphs)} paragraphs, "
+                f"using per-paragraph material matching"
+            )
+
+            paragraph_terms = llm.generate_paragraph_terms(
+                video_subject=params.video_subject,
+                paragraphs=paragraphs,
+                terms_per_paragraph=2,
+            )
+
+            paragraph_terms = [
+                twelvelabs.rerank_terms_by_subject(
+                    video_subject=params.video_subject,
+                    search_terms=terms,
+                )
+                for terms in paragraph_terms
+            ]
+
+            per_para_duration = audio_duration / max(len(paragraphs), 1)
+            paragraph_audio_durations = [per_para_duration] * len(paragraphs)
+
+            downloaded_videos = material.download_videos_by_paragraphs(
+                task_id=task_id,
+                paragraph_terms=paragraph_terms,
+                source=params.video_source,
+                video_aspect=params.video_aspect,
+                audio_duration=audio_duration * params.video_count,
+                max_clip_duration=params.video_clip_duration,
+                paragraph_audio_durations=paragraph_audio_durations,
+                use_comfyui_fallback=use_comfyui_fallback,
+            )
+        else:
+            downloaded_videos = material.download_videos(
+                task_id=task_id,
+                search_terms=video_terms,
+                source=params.video_source,
+                video_aspect=params.video_aspect,
+                video_concat_mode=(
+                    VideoConcatMode.sequential
+                    if params.match_materials_to_script
+                    else params.video_concat_mode
+                ),
+                audio_duration=audio_duration * params.video_count,
+                max_clip_duration=params.video_clip_duration,
+                match_script_order=params.match_materials_to_script,
+                use_comfyui_fallback=use_comfyui_fallback,
+            )
+
         if not downloaded_videos:
             _mark_task_failed(
                 task_id,

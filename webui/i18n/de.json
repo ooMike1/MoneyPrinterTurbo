@@ -252,6 +252,11 @@
     "Video Source Settings": "**Videoquellen-Einstellungen**",
     "Coverr": "Coverr",
     "Coverr API Key": "Coverr API-Schlüssel ([API-Schlüssel holen](https://coverr.co/developers?ctx=header_navigation))",
-    "Please Enter the Coverr API Key": "Bitte geben Sie den **Coverr API-Schlüssel** ein"
+    "Please Enter the Coverr API Key": "Bitte geben Sie den **Coverr API-Schlüssel** ein",
+    "Auto (all providers)": "Auto (alle Anbieter)",
+    "ComfyUI": "ComfyUI",
+    "ComfyUI API Key": "ComfyUI-API-Schlüssel (optional)",
+    "ComfyUI Base URL": "ComfyUI-Basis-URL",
+    "ComfyUI Base URL Help": "URL des ComfyUI-Brückendienstes (z.B. http://localhost:8188). Wird zum Suchen oder Erstellen von KI-Videoclips verwendet."
   }
 }

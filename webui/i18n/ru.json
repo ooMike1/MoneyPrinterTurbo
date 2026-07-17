@@ -252,6 +252,11 @@
     "Custom Position (% from top)": "Пользовательское положение (% от верхнего края)",
     "Please enter a value between 0 and 100": "Введите значение от 0 до 100",
     "Please enter a valid number": "Введите корректное число",
-    "Please Select a Valid Video Source": "Выберите поддерживаемый источник материалов"
+    "Please Select a Valid Video Source": "Выберите поддерживаемый источник материалов",
+    "Auto (all providers)": "Авто (все провайдеры)",
+    "ComfyUI": "ComfyUI",
+    "ComfyUI API Key": "Ключ API ComfyUI (необязательно)",
+    "ComfyUI Base URL": "Базовый URL ComfyUI",
+    "ComfyUI Base URL Help": "URL мостового сервиса ComfyUI (например, http://localhost:8188). Используется для поиска или создания AI-видеоклипов."
   }
 }

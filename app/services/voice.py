@@ -24,6 +24,7 @@ from moviepy.audio.io.AudioFileClip import AudioFileClip
 from openai import OpenAI
 
 from app.config import config
+from app.models import const
 from app.utils import utils
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
@@ -1619,10 +1620,16 @@ def _build_subtitle_items_from_edge_cues(
         current_text = ""
         current_start_time = None
 
-    if current_text.strip():
-        logger.warning(
-            f"edge cues still have unmatched text after aggregation: {current_text}"
-        )
+    leftover = current_text.strip()
+    if leftover:
+        if leftover.strip(const.PUNCTUATIONS + " \t"):
+            logger.warning(
+                f"edge cues still have unmatched text after aggregation: {leftover}"
+            )
+        else:
+            logger.debug(
+                f"edge cues leftover is only punctuation, skipping: {leftover!r}"
+            )
 
     return sub_items
 
@@ -1666,10 +1673,16 @@ def _build_subtitle_items_from_legacy_submaker(
         start_time = -1.0
         sub_line = ""
 
-    if sub_line.strip():
-        logger.warning(
-            f"legacy subtitle items still have unmatched text after aggregation: {sub_line}"
-        )
+    leftover = sub_line.strip()
+    if leftover:
+        if leftover.strip(const.PUNCTUATIONS + " \t"):
+            logger.warning(
+                f"legacy subtitle items still have unmatched text after aggregation: {leftover}"
+            )
+        else:
+            logger.debug(
+                f"legacy subtitle items leftover is only punctuation, skipping: {leftover!r}"
+            )
 
     return sub_items
 

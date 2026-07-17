@@ -252,6 +252,11 @@
     "Please Enter the Coverr API Key": "Silakan Masukkan **Kunci API Coverr**",
     "Video Encoder": "Encoder Video",
     "Default Video Encoder": "Default (Direkomendasikan)",
-    "Video Encoder Help": "Opsi lanjutan. Default mengikuti kebijakan encoder stabil aplikasi, saat ini libx264. Jika encoder perangkat keras tidak tersedia, aplikasi otomatis kembali ke libx264."
+    "Video Encoder Help": "Opsi lanjutan. Default mengikuti kebijakan encoder stabil aplikasi, saat ini libx264. Jika encoder perangkat keras tidak tersedia, aplikasi otomatis kembali ke libx264.",
+    "Auto (all providers)": "Otomatis (semua penyedia)",
+    "ComfyUI": "ComfyUI",
+    "ComfyUI API Key": "Kunci API ComfyUI (opsional)",
+    "ComfyUI Base URL": "URL Dasar ComfyUI",
+    "ComfyUI Base URL Help": "URL layanan jembatan ComfyUI (mis. http://localhost:8188). Digunakan untuk mencari atau menghasilkan klip video AI."
   }
 }

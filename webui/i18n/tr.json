@@ -252,6 +252,11 @@
     "Please Enter the Coverr API Key": "Lütfen **Coverr API Anahtarını** girin",
     "Video Encoder": "Video Kodlayıcı",
     "Default Video Encoder": "Varsayılan (Önerilen)",
-    "Video Encoder Help": "Gelişmiş seçenek. Varsayılan, uygulamanın kararlı kodlayıcı politikasını izler; şu anda libx264 kullanılır. Donanım kodlayıcı kullanılamıyorsa uygulama otomatik olarak libx264'e döner."
+    "Video Encoder Help": "Gelişmiş seçenek. Varsayılan, uygulamanın kararlı kodlayıcı politikasını izler; şu anda libx264 kullanılır. Donanım kodlayıcı kullanılamıyorsa uygulama otomatik olarak libx264'e döner.",
+    "Auto (all providers)": "Otomatik (tüm sağlayıcılar)",
+    "ComfyUI": "ComfyUI",
+    "ComfyUI API Key": "ComfyUI API Anahtarı (isteğe bağlı)",
+    "ComfyUI Base URL": "ComfyUI Temel URL",
+    "ComfyUI Base URL Help": "ComfyUI köprü hizmetinin URL'si (örn. http://localhost:8188). AI video klipleri aramak veya oluşturmak için kullanılır."
   }
 }

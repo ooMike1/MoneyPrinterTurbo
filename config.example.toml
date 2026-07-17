@@ -326,6 +326,21 @@ model_id = "chatterbox"
 # Voice names exposed by the configured Chatterbox server.
 voices = ["default-Female"]
 
+[comfyui]
+# Local video-generation provider. Points to a small HTTP bridge (e.g. a
+# FastAPI service) that maps each search term to a ComfyUI workflow, renders
+# clips, and serves the resulting MP4s over HTTP. The bridge only needs to
+# expose GET <base_url>/search?query=<term>&orientation=<orientación>&per_page=N
+# returning {"videos": [{"duration": ..., "url": ...}, ...]}.
+base_url = "http://127.0.0.1:8188"
+# Optional bearer token if your bridge requires authentication.
+api_key = ""
+# Seconds to wait for the search endpoint to respond. If your bridge generates
+# clips on demand, set this high enough to let the slowest workflow finish.
+timeout = 600
+# How many clips to request per keyword. Lower this if your bridge is slow.
+clips_per_term = 20
+
 # =============================================================================
 # WebUI Preferences / WebUI 偏好
 # =============================================================================

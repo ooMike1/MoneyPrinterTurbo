@@ -116,6 +116,7 @@ _FINAL_VIDEO_PATTERN = re.compile(
     r"^final-(?P<index>\d+)\.(?P<extension>mp4|mov|mkv|webm)$",
     re.IGNORECASE,
 )
+LAST_CONFIG_FILE = os.path.join(root_dir, "storage", "last_config.json")
 
 
 # -----------------------------------------------------------------------------
@@ -986,6 +987,37 @@ def _apply_pending_task_restore():
     st.session_state["task_restore_succeeded"] = True
     logger.info(f"restored task configuration: {payload['task_id']}")
     return True
+
+
+def _save_last_config(params):
+    try:
+        data = params.model_dump(mode="json")
+        os.makedirs(os.path.dirname(LAST_CONFIG_FILE), exist_ok=True)
+        with open(LAST_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info("saved last used configuration")
+    except Exception as e:
+        logger.warning(f"failed to save last config: {e}")
+
+
+def _auto_restore_last_config():
+    if not os.path.isfile(LAST_CONFIG_FILE):
+        return
+    if st.session_state.get("_last_config_restored", False):
+        return
+    try:
+        with open(LAST_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        params = VideoParams.model_validate(data)
+        st.session_state["task_restore_payload"] = {
+            "task_id": "__last_config__",
+            "subject": params.video_subject or params.video_script or "last config",
+            "params": params.model_dump(mode="json"),
+        }
+        st.session_state["_last_config_restored"] = True
+        logger.info("auto-restored last used configuration")
+    except Exception as e:
+        logger.warning(f"failed to auto-restore last config: {e}")
 
 
 def _dismiss_task_restore_dialog():
@@ -2030,6 +2062,34 @@ def _render_settings_dialog():
             )
             _save_material_api_keys("coverr_api_keys", coverr_api_key)
 
+            comfyui_base_url = config.comfyui.get("base_url", "")
+            comfyui_base_url = st.text_input(
+                tr("ComfyUI Base URL"),
+                value=comfyui_base_url,
+                key="comfyui_base_url_input",
+                help=tr("ComfyUI Base URL Help"),
+            )
+            config.comfyui["base_url"] = (comfyui_base_url or "").strip()
+
+            comfyui_api_key = config.comfyui.get("api_key", "")
+            comfyui_api_key = st.text_input(
+                tr("ComfyUI API Key"),
+                value=comfyui_api_key,
+                type="password",
+                key="comfyui_api_key_input",
+            )
+            config.comfyui["api_key"] = (comfyui_api_key or "").strip()
+
+            deapi_api_key = config.app.get("deapi_api_key", "")
+            deapi_api_key = st.text_input(
+                tr("deAPI.ai API Key"),
+                value=deapi_api_key,
+                type="password",
+                key="deapi_api_key_input",
+                help=tr("deAPI API Key Help"),
+            )
+            config.app["deapi_api_key"] = (deapi_api_key or "").strip()
+
     config.save_config()
 
 
@@ -2207,9 +2267,11 @@ def _render_video_settings(panel, params):
                 (tr("Random"), "random"),
             ]
             video_sources = [
+                (tr("Auto (all providers)"), "auto"),
                 (tr("Pexels"), "pexels"),
                 (tr("Pixabay"), "pixabay"),
                 (tr("Coverr"), "coverr"),
+                (tr("ComfyUI"), "comfyui"),
                 (tr("Local file"), "local"),
             ]
 
@@ -3316,6 +3378,7 @@ def _render_generation_controls(
     render_onboarding_tour()
     if start_button:
         config.save_config()
+        _save_last_config(params)
         task_id = st.session_state.get("pending_generation_task_id") or str(uuid4())
         _add_active_generation_task(
             task_id,
@@ -3326,7 +3389,7 @@ def _render_generation_controls(
             st.error(tr("Video Script and Subject Cannot Both Be Empty"))
             st.stop()
 
-        if params.video_source not in ["pexels", "pixabay", "coverr", "local"]:
+        if params.video_source not in ["pexels", "pixabay", "coverr", "comfyui", "local", "auto"]:
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()
@@ -3497,6 +3560,7 @@ def _render_application():
     if st.session_state.get("settings_dialog_open", False):
         _render_settings_dialog()
 
+    _auto_restore_last_config()
     restore_applied = _apply_pending_task_restore()
     restore_candidate_id = st.session_state.get("task_restore_candidate_id")
     if restore_candidate_id:

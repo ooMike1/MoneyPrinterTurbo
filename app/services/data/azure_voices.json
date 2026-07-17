@@ -1322,5 +1322,21 @@
   {
     "name": "zh-CN-XiaoxiaoMultilingualNeural-V2",
     "gender": "Female"
+  },
+  {
+    "name": "es-ES-ArabellaMultilingualNeural-V2",
+    "gender": "Female"
+  },
+  {
+    "name": "es-ES-IsidoraMultilingualNeural-V2",
+    "gender": "Female"
+  },
+  {
+    "name": "es-ES-TristanMultilingualNeural-V2",
+    "gender": "Male"
+  },
+  {
+    "name": "es-ES-XimenaMultilingualNeural-V2",
+    "gender": "Female"
   }
 ]

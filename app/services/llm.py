@@ -582,6 +582,91 @@ def _strip_code_fence(text: str) -> str:
     return t.strip()
 
 
+def generate_paragraph_terms(
+    video_subject: str,
+    paragraphs: List[str],
+    terms_per_paragraph: int = 2,
+) -> List[List[str]]:
+    """
+    Generate specific visual search terms for EACH paragraph of the script.
+
+    Returns a list of lists: for each paragraph, a list of search terms.
+    Each term describes a concrete visual scene that matches the paragraph's topic.
+    """
+    logger.info(
+        f"generating per-paragraph terms: subject={video_subject}, "
+        f"paragraphs={len(paragraphs)}, terms_per_paragraph={terms_per_paragraph}"
+    )
+    result: List[List[str]] = []
+
+    for para_idx, paragraph in enumerate(paragraphs):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            result.append([])
+            continue
+
+        prompt = f"""
+# Role: Video Scene Term Generator
+
+## Goal
+Generate {terms_per_paragraph} short visual search terms for stock video footage
+that matches the following paragraph from a video script.
+
+## Constraints
+1. Return ONLY a JSON array of strings, no other text.
+2. Each term must describe a concrete, searchable visual scene (2-5 words).
+3. Terms must be visually distinct from each other.
+4. Include shot type hints: "close up", "wide shot", "aerial view", "dolly shot", etc.
+5. Use English only.
+
+## Video Subject
+{video_subject}
+
+## Script Paragraph ({para_idx + 1} of {len(paragraphs)})
+{paragraph}
+
+## Output Example
+["close up doctor using digital tablet", "wide shot hospital corridor with medical staff"]
+""".strip()
+
+        terms: List[str] = []
+        response = ""
+        for i in range(_max_retries):
+            try:
+                response = _generate_response(prompt)
+                if response.startswith("Error: "):
+                    logger.error(f"failed to generate paragraph terms: {response}")
+                    break
+                terms = json.loads(_strip_code_fence(response))
+                if isinstance(terms, list) and all(isinstance(t, str) for t in terms):
+                    break
+            except Exception as e:
+                logger.warning(
+                    f"failed to generate terms for paragraph {para_idx + 1}: {e}"
+                )
+                if response:
+                    match = re.search(r"\[.*\]", response, re.DOTALL)
+                    if match:
+                        try:
+                            terms = json.loads(match.group())
+                        except Exception:
+                            pass
+
+        if terms and len(terms) > 0:
+            result.append(terms)
+            logger.debug(
+                f"paragraph {para_idx + 1}: {len(terms)} terms: {terms[:3]}"
+            )
+        else:
+            result.append([paragraph.split(".")[0].strip()[:50]])
+
+    successful = sum(1 for t in result if t)
+    logger.success(
+        f"generated per-paragraph terms for {successful}/{len(paragraphs)} paragraphs"
+    )
+    return result
+
+
 def generate_terms(
     video_subject: str,
     video_script: str,
@@ -597,8 +682,6 @@ def generate_terms(
             "6. keep the terms in the same order as the script narration; "
             "earlier terms must describe earlier visual moments."
         )
-        # 有序关键词模式下，示例数量要和 amount 保持一致，避免模型被固定
-        # 的 4 个示例误导，导致长文案只返回少量关键词，影响素材覆盖度。
         example_terms = [
             "opening visual topic",
             *[f"script visual topic {index}" for index in range(2, max(amount, 1))],
@@ -607,8 +690,8 @@ def generate_terms(
         output_example = json.dumps(example_terms[:amount], ensure_ascii=False)
     else:
         goal = (
-            f"Generate {amount} search terms for stock videos, depending on the "
-            "subject of a video."
+            f"Generate {amount} visually diverse search terms to find high-quality "
+            "stock video footage for the video subject."
         )
         ordering_rule = ""
         output_example = (
@@ -624,10 +707,13 @@ def generate_terms(
 
 ## Constrains:
 1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 words, always add the main subject of the video.
-3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
-4. the search terms must be related to the subject of the video.
-5. reply with english search terms only.
+2. each search term should describe a specific visual scene or shot. include camera style hints when relevant (e.g. "close up", "wide shot", "aerial view", "time lapse", "slow motion").
+3. do NOT repeat the same root word or concept across multiple terms — each term must describe a visually distinct scene.
+4. terms should be 2-5 words long and visually descriptive. avoid generic single-word terms.
+5. you must only return the json-array of strings. you must not return anything else. you must not return the script.
+6. the search terms must be closely related to specific topics mentioned in the video script.
+7. reply with english search terms only.
+8. include a mix of shot types: some close-ups, some wide angles, some detail shots.
 {ordering_rule}
 
 ## Output Example:

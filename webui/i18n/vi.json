@@ -252,6 +252,11 @@
     "Please Enter the Coverr API Key": "Vui lòng nhập **API Key Coverr**",
     "Video Encoder": "Bộ Mã Hóa Video",
     "Default Video Encoder": "Mặc định (Khuyên dùng)",
-    "Video Encoder Help": "Tùy chọn nâng cao. Mặc định tuân theo chính sách mã hóa ổn định của ứng dụng, hiện là libx264. Nếu bộ mã hóa phần cứng không khả dụng, ứng dụng tự động chuyển về libx264."
+    "Video Encoder Help": "Tùy chọn nâng cao. Mặc định tuân theo chính sách mã hóa ổn định của ứng dụng, hiện là libx264. Nếu bộ mã hóa phần cứng không khả dụng, ứng dụng tự động chuyển về libx264.",
+    "Auto (all providers)": "Tự động (tất cả nhà cung cấp)",
+    "ComfyUI": "ComfyUI",
+    "ComfyUI API Key": "Khóa API ComfyUI (tùy chọn)",
+    "ComfyUI Base URL": "URL gốc ComfyUI",
+    "ComfyUI Base URL Help": "URL của dịch vụ cầu nối ComfyUI (ví dụ: http://localhost:8188). Được sử dụng để tìm kiếm hoặc tạo clip video AI."
   }
 }

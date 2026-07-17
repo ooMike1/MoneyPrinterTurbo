@@ -21,6 +21,7 @@ from moviepy import (
     TextClip,
     VideoFileClip,
     afx,
+    vfx,
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageDraw, ImageFont
@@ -525,6 +526,82 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     return ""
 
 
+def _apply_gentle_zoom(clip, max_scale: float = 1.05):
+    """
+    Apply a subtle Ken Burns zoom-in effect over the entire clip duration.
+
+    Scale starts at 1.0 and ends at `max_scale`. This makes static footage
+    feel more dynamic without being distracting. Falls back to original clip
+    if the transform fails.
+    """
+    import numpy as np
+    from PIL import Image
+
+    duration = max(clip.duration, 0.001)
+
+    def scale_effect(get_frame, t):
+        progress = min(max(t / duration, 0), 1)
+        scale = 1.0 + (max_scale - 1.0) * progress
+        frame = get_frame(t)
+        h, w = frame.shape[:2]
+        if abs(scale - 1.0) < 1e-6:
+            return frame
+        crop_w = w / scale
+        crop_h = h / scale
+        left = (w - crop_w) / 2
+        top = (h - crop_h) / 2
+        pil_img = Image.fromarray(frame)
+        transformed = pil_img.transform(
+            (w, h),
+            Image.Transform.EXTENT,
+            (left, top, left + crop_w, top + crop_h),
+            resample=Image.Resampling.BILINEAR,
+        )
+        return np.asarray(transformed)
+
+    try:
+        return clip.transform(scale_effect)
+    except Exception:
+        return clip
+
+
+def _create_blurred_background(clip, target_width: int, target_height: int):
+    """
+    Create a blurred, full-canvas version of the clip as background.
+
+    The clip is scaled to cover the entire canvas, then heavily blurred.
+    This gives a professional "bokeh background" look instead of black bars.
+    Falls back to a solid black background on any error.
+    """
+    import numpy as np
+    from PIL import Image
+
+    try:
+        clip_w, clip_h = clip.size
+        if clip_w <= 0 or clip_h <= 0:
+            raise ValueError("invalid clip dimensions")
+
+        scale = max(target_width / clip_w, target_height / clip_h)
+        new_w = max(1, int(clip_w * scale))
+        new_h = max(1, int(clip_h * scale))
+        blurred = clip.resized(new_size=(new_w, new_h))
+
+        x_center = int((new_w - target_width) / 2)
+        y_center = int((new_h - target_height) / 2)
+        blurred = blurred.cropped(
+            x1=x_center, y1=y_center,
+            width=target_width, height=target_height
+        )
+
+        blurred = blurred.with_effects([vfx.GaussianBlur(kernel_size=35)])
+        return blurred
+    except Exception:
+        pass
+
+    from moviepy import ColorClip
+    return ColorClip(size=(target_width, target_height), color=(0, 0, 0)).with_duration(clip.duration)
+
+
 def combine_videos(
     combined_video_path: str,
     video_paths: List[str],
@@ -631,6 +708,9 @@ def combine_videos(
             if normalized_clip_speed != 1.0:
                 clip = clip.with_speed_scaled(normalized_clip_speed)
             clip_duration = clip.duration
+            is_ai_clip = "ai_clip_" in os.path.basename(subclipped_item.source_file_path)
+            if not is_ai_clip:
+                clip = _apply_gentle_zoom(clip)
             # Not all videos are same size, so we need to resize them
             clip_w, clip_h = clip.size
             if clip_w != video_width or clip_h != video_height:
@@ -638,20 +718,26 @@ def combine_videos(
                 video_ratio = video_width / video_height
                 logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
                 
-                if clip_ratio == video_ratio:
+                if abs(clip_ratio - video_ratio) < 1e-6:
                     clip = clip.resized(new_size=(video_width, video_height))
                 else:
                     if clip_ratio > video_ratio:
-                        scale_factor = video_width / clip_w
-                    else:
                         scale_factor = video_height / clip_h
+                        new_height = video_height
+                        new_width = max(video_width, round(clip_w * scale_factor))
+                    else:
+                        scale_factor = video_width / clip_w
+                        new_width = video_width
+                        new_height = max(video_height, round(clip_h * scale_factor))
 
-                    new_width = int(clip_w * scale_factor)
-                    new_height = int(clip_h * scale_factor)
-
-                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
-                    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-                    clip = CompositeVideoClip([background, clip_resized])
+                    try:
+                        bg_clip = _create_blurred_background(clip, video_width, video_height)
+                        clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
+                        clip = CompositeVideoClip([bg_clip, clip_resized])
+                    except Exception:
+                        background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
+                        clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
+                        clip = CompositeVideoClip([background, clip_resized])
                     
             shuffle_side = random.choice(["left", "right", "top", "bottom"])
             if transition_value in (None, VideoTransitionMode.none.value):
