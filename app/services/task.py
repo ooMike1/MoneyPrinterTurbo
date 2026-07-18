@@ -577,6 +577,24 @@ def _split_script_into_paragraphs(script: str) -> List[str]:
     return [p for p in paragraphs if p]
 
 
+def _split_script_into_sentences(script: str) -> List[str]:
+    """Split a video script into sentences by punctuation."""
+    # Split on sentence-ending punctuation (English + Chinese) followed by optional whitespace
+    # Use a more robust pattern that captures the delimiter
+    parts = re.split(r"([.!?。！？])", script.strip())
+    sentences = []
+    current = ""
+    for part in parts:
+        current += part
+        if part in ".!?。！？":
+            if current.strip():
+                sentences.append(current.strip())
+            current = ""
+    if current.strip():
+        sentences.append(current.strip())
+    return sentences
+
+
 def get_video_materials(task_id, params, video_terms, audio_duration):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
@@ -600,6 +618,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             and config.app.get("comfyui_fallback_enabled", True)
         )
 
+        logger.info(f"[get_video_materials] task_id={task_id}, video_source={params.video_source}, use_comfyui_fallback={use_comfyui_fallback}")
         video_script = params.video_script
         if not video_script:
             script_file = path.join(utils.task_dir(task_id), "script.json")
@@ -612,13 +631,64 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                 except Exception:
                     pass
 
-        should_match_paragraphs = (
-            params.match_materials_to_script
+        # Check granularity config: "sentence" | "paragraph" | "global"
+        clip_granularity = str(config.app.get("clip_granularity", "paragraph")).strip().lower()
+
+        # Sentence-level: most granular, matches visuals to each sentence
+        should_match_sentences = (
+            clip_granularity == "sentence"
             and video_script
             and source_supports_paragraph_mode(params.video_source)
         )
 
-        if should_match_paragraphs:
+        # Paragraph-level: current behavior
+        should_match_paragraphs = (
+            clip_granularity in ("paragraph", "auto")
+            and params.match_materials_to_script
+            and video_script
+            and source_supports_paragraph_mode(params.video_source)
+        )
+
+        if should_match_sentences:
+            sentences = _split_script_into_sentences(video_script)
+            logger.info(
+                f"script has {len(sentences)} sentences, "
+                f"using per-sentence material matching"
+            )
+
+            sentence_terms = llm.generate_sentence_terms(
+                video_subject=params.video_subject,
+                sentences=sentences,
+                terms_per_sentence=2,
+            )
+
+            # Optional: rerank with TwelveLabs
+            sentence_terms = [
+                twelvelabs.rerank_terms_by_subject(
+                    video_subject=params.video_subject,
+                    search_terms=terms,
+                )
+                for terms in sentence_terms
+            ]
+
+            # Distribute audio duration across sentences proportionally
+            total_chars = sum(len(s) for s in sentences) or 1
+            sentence_audio_durations = [
+                (len(s) / total_chars) * audio_duration * params.video_count
+                for s in sentences
+            ]
+
+            downloaded_videos = material.download_videos_by_sentences(
+                task_id=task_id,
+                sentence_terms=sentence_terms,
+                source=params.video_source,
+                video_aspect=params.video_aspect,
+                audio_duration=audio_duration * params.video_count,
+                max_clip_duration=params.video_clip_duration,
+                sentence_audio_durations=sentence_audio_durations,
+                use_comfyui_fallback=use_comfyui_fallback,
+            )
+        elif should_match_paragraphs:
             paragraphs = _split_script_into_paragraphs(video_script)
             logger.info(
                 f"script has {len(paragraphs)} paragraphs, "
@@ -653,6 +723,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                 use_comfyui_fallback=use_comfyui_fallback,
             )
         else:
+            logger.info(f"[get_video_materials] calling download_videos with video_terms={video_terms}")
             downloaded_videos = material.download_videos(
                 task_id=task_id,
                 search_terms=video_terms,
@@ -669,7 +740,9 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                 use_comfyui_fallback=use_comfyui_fallback,
             )
 
+        logger.info(f"[get_video_materials] downloaded_videos count: {len(downloaded_videos) if downloaded_videos else 0}")
         if not downloaded_videos:
+            logger.error(f"[get_video_materials] download_videos returned empty! video_source={params.video_source}, video_terms={video_terms}, audio_duration={audio_duration * params.video_count}")
             _mark_task_failed(
                 task_id,
                 "materials",

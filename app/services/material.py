@@ -5,6 +5,7 @@ import threading
 from typing import List
 from urllib.parse import urlencode
 
+import numpy as np
 import requests
 from loguru import logger
 from moviepy.video.io.VideoFileClip import VideoFileClip
@@ -17,6 +18,46 @@ from app.utils import utils
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
+
+# Embedding model cache
+_embedding_model = None
+_embedding_model_name = None
+_embedding_load_error = None
+
+
+def _get_embedding_model():
+    """Load and cache the sentence-transformers embedding model."""
+    global _embedding_model, _embedding_model_name, _embedding_load_error
+
+    model_name = config.app.get(
+        "embedding_model", "sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+    if _embedding_model is not None and _embedding_model_name == model_name:
+        return _embedding_model
+
+    if _embedding_load_error is not None:
+        return None
+
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        logger.info(f"Loading embedding model: {model_name}")
+        _embedding_model = SentenceTransformer(model_name)
+        _embedding_model_name = model_name
+        logger.success(f"Embedding model loaded: {model_name}")
+        return _embedding_model
+    except ImportError:
+        _embedding_load_error = "sentence-transformers not installed"
+        logger.warning(
+            "sentence-transformers not installed; semantic search disabled. "
+            "Install with: pip install sentence-transformers"
+        )
+        return None
+    except Exception as e:
+        _embedding_load_error = str(e)
+        logger.warning(f"Failed to load embedding model: {e}")
+        return None
 
 
 def _get_tls_verify() -> bool:
@@ -70,22 +111,30 @@ def search_videos_pexels(
     # Build URL
     params = {"query": search_term, "per_page": 20, "orientation": video_orientation}
     query_url = f"https://api.pexels.com/videos/search?{urlencode(params)}"
-    logger.info(f"searching videos: {query_url}, with proxies: {config.proxy}")
+    logger.info(f"[pexels] searching videos: {query_url}, with proxies: {config.proxy}")
 
-    try:
-        r = requests.get(
-            query_url,
-            headers=headers,
-            proxies=config.proxy,
-            verify=_get_tls_verify(),
-            timeout=(30, 60),
-        )
-        response = r.json()
-        video_items = []
-        if "videos" not in response:
-            logger.error(f"search videos failed: {response}")
-            return video_items
-        videos = response["videos"]
+try:
+            r = requests.get(
+                query_url,
+                headers=headers,
+                proxies=config.proxy,
+                verify=_get_tls_verify(),
+                timeout=(30, 60),
+            )
+            logger.info(f"[pexels] response status: {r.status_code}")
+            response = r.json()
+            logger.info(f"[pexels] response keys: {list(response.keys())}")
+            video_items = []
+            if "videos" not in response:
+                logger.error(f"[pexels] search videos failed: {response}")
+                return video_items
+            videos = response["videos"]
+            logger.info(f"[pexels] found {len(videos)} videos in response")
+        target_ratio = video_width / video_height
+        ratio_tolerance = 0.15
+        # Si ningún video encaja con el aspect objetivo, recogemos los mejores
+        # candidatos por cercanía de ratio para usarlos como respaldo.
+        aspect_mismatch_candidates: List[tuple] = []
         # loop through each video in the result
         for v in videos:
             duration = v["duration"]
@@ -94,6 +143,10 @@ def search_videos_pexels(
                 continue
             video_files = v["video_files"]
             # loop through each url to determine the best quality
+            exact_match_found = False
+            best_mismatch = None
+            best_mismatch_ratio_diff = None
+            best_mismatch_resolution = 0
             for video in video_files:
                 w = int(video["width"])
                 h = int(video["height"])
@@ -104,9 +157,59 @@ def search_videos_pexels(
                     item.duration = duration
                     item.width = w
                     item.height = h
-                    item.tags = v.get("url", "").rstrip("/").split("/")[-1].replace("-", " ") if v.get("url") else ""
+                    item.tags = (
+                        v.get("url", "").rstrip("/").split("/")[-1].replace("-", " ")
+                        if v.get("url")
+                        else ""
+                    )
                     video_items.append(item)
+                    exact_match_found = True
                     break
+                # Acumulamos el archivo de mayor resolución del clip como
+                # candidato potencial para el fallback de aspect.
+                if w > 0 and h > 0:
+                    clip_ratio = w / h
+                    ratio_diff = abs(clip_ratio - target_ratio) / max(
+                        target_ratio, 0.01
+                    )
+                    if (
+                        ratio_diff > ratio_tolerance
+                        and w * h > best_mismatch_resolution
+                    ):
+                        best_mismatch_ratio_diff = ratio_diff
+                        best_mismatch = {
+                            "link": video["link"],
+                            "width": w,
+                            "height": h,
+                        }
+                        best_mismatch_resolution = w * h
+            if not exact_match_found and best_mismatch is not None:
+                aspect_mismatch_candidates.append(
+                    (best_mismatch_ratio_diff, best_mismatch, duration, v)
+                )
+        # Fallback: si ningún clip cumple el aspect objetivo, reutilizamos los
+        # mejores candidatos por cercanía de ratio. La pipeline posterior se
+        # encarga de recortar/letterboxear al aspect final.
+        if not video_items and aspect_mismatch_candidates:
+            logger.warning(
+                f"  pexels: no clips matched target aspect {target_ratio:.3f}; "
+                f"falling back to {min(len(aspect_mismatch_candidates), 20)} closest-ratio clips"
+            )
+            aspect_mismatch_candidates.sort(key=lambda c: c[0])
+            for _, best_mismatch, duration, v in aspect_mismatch_candidates[:20]:
+                item = MaterialInfo()
+                item.provider = "pexels"
+                item.url = best_mismatch["link"]
+                item.duration = duration
+                item.width = best_mismatch["width"]
+                item.height = best_mismatch["height"]
+                item.tags = (
+                    v.get("url", "").rstrip("/").split("/")[-1].replace("-", " ")
+                    if v.get("url")
+                    else ""
+                )
+                item.tags = f"{item.tags} _aspect_fallback".strip()
+                video_items.append(item)
         return video_items
     except Exception as e:
         logger.error(f"search videos failed: {str(e)}")
@@ -132,19 +235,27 @@ def search_videos_pixabay(
         "key": api_key,
     }
     query_url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
-    logger.info(f"searching videos: {query_url}, with proxies: {config.proxy}")
+    logger.info(f"[pixabay] searching videos: {query_url}, with proxies: {config.proxy}")
 
     try:
         r = requests.get(
             query_url, proxies=config.proxy, verify=_get_tls_verify(), timeout=(30, 60)
         )
+        logger.info(f"[pixabay] response status: {r.status_code}")
         response = r.json()
+        logger.info(f"[pixabay] response keys: {list(response.keys())}")
         video_items = []
         if "hits" not in response:
-            logger.error(f"search videos failed: {response}")
+            logger.error(f"[pixabay] search videos failed: {response}")
             return video_items
         videos = response["hits"]
+        logger.info(f"[pixabay] found {len(videos)} videos in response")
         # loop through each video in the result
+        target_ratio = video_width / video_height
+        ratio_tolerance = 0.15
+        # Almacenamos los clips cuya relación de aspecto no encaja, para usarlos
+        # como respaldo cuando el catálogo vertical del provider esté vacío.
+        aspect_mismatch_candidates: List[tuple] = []
         for v in videos:
             duration = v["duration"]
             # check if video has desired minimum duration
@@ -159,9 +270,19 @@ def search_videos_pixabay(
                 if w < video_width or h <= 0:
                     continue
                 clip_ratio = w / h
-                target_ratio = video_width / video_height
-                if abs(clip_ratio - target_ratio) / max(target_ratio, 0.01) > 0.15:
-                    logger.debug(f"  pixabay: skipping clip with ratio {clip_ratio:.3f} (target {target_ratio:.3f})")
+                ratio_diff = abs(clip_ratio - target_ratio) / max(
+                    target_ratio, 0.01
+                )
+                if ratio_diff > ratio_tolerance:
+                    logger.debug(
+                        f"  pixabay: skipping clip with ratio {clip_ratio:.3f} (target {target_ratio:.3f})"
+                    )
+                    # Guardamos por si ningún clip encaja con el aspect objetivo.
+                    # Priorizamos los más cercanos al ratio target.
+                    if h >= video_width or w >= video_width:
+                        aspect_mismatch_candidates.append(
+                            (ratio_diff, video_type, v, video)
+                        )
                     continue
                 item = MaterialInfo()
                 item.provider = "pixabay"
@@ -170,9 +291,40 @@ def search_videos_pixabay(
                 item.width = w
                 item.height = h
                 item.tags = v.get("tags", "")
-                item.description = v.get("pageURL", "").rstrip("/").split("/")[-1].replace("-", " ") if v.get("pageURL") else v.get("tags", "")
+                item.description = (
+                    v.get("pageURL", "").rstrip("/").split("/")[-1].replace("-", " ")
+                    if v.get("pageURL")
+                    else v.get("tags", "")
+                )
                 video_items.append(item)
                 break
+        # Fallback: si ningún clip cumple el aspect ratio objetivo, reutilizamos
+        # los mejores candidatos por cercanía de ratio. La pipeline posterior
+        # (video.py) se encarga de recortar/letterboxear el clip al aspect final.
+        if not video_items and aspect_mismatch_candidates:
+            logger.warning(
+                f"  pixabay: no clips matched target aspect {target_ratio:.3f}; "
+                f"falling back to {min(len(aspect_mismatch_candidates), 20)} closest-ratio clips"
+            )
+            aspect_mismatch_candidates.sort(key=lambda c: c[0])
+            for _, _, v, video in aspect_mismatch_candidates[:20]:
+                w = int(video["width"])
+                h = int(video.get("height", 0)) or w
+                duration = v["duration"]
+                item = MaterialInfo()
+                item.provider = "pixabay"
+                item.url = video["url"]
+                item.duration = duration
+                item.width = w
+                item.height = h
+                item.tags = v.get("tags", "")
+                item.description = (
+                    v.get("pageURL", "").rstrip("/").split("/")[-1].replace("-", " ")
+                    if v.get("pageURL")
+                    else v.get("tags", "")
+                )
+                item.tags = f"{item.tags} _aspect_fallback".strip()
+                video_items.append(item)
         return video_items
     except Exception as e:
         logger.error(f"search videos failed: {str(e)}")
@@ -250,7 +402,9 @@ def search_videos_comfyui(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    logger.info(f"searching videos on ComfyUI: {query_url}, with proxies: {config.proxy}")
+    logger.info(
+        f"searching videos on ComfyUI: {query_url}, with proxies: {config.proxy}"
+    )
 
     try:
         r = requests.get(
@@ -322,6 +476,8 @@ def search_videos_coverr(
     GET 这个 URL 本身就被 Coverr 当作一次合法的 download 事件计入统计,
     无需再调用 PATCH /videos/:id/stats/downloads。
     """
+    aspect = VideoAspect(video_aspect)
+    video_width, video_height = aspect.to_resolution()
     api_key = get_api_key("coverr_api_keys")
     headers = {"Authorization": f"Bearer {api_key}"}
     params = {
@@ -341,11 +497,13 @@ def search_videos_coverr(
             verify=_get_tls_verify(),
             timeout=(30, 60),
         )
+        logger.info(f"[coverr] response status: {r.status_code}")
         response = r.json()
+        logger.info(f"[coverr] response type: {type(response)}, keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
         video_items: List[MaterialInfo] = []
 
         if not isinstance(response, dict) or "hits" not in response:
-            logger.error(f"search videos failed: {response}")
+            logger.error(f"[coverr] search videos failed: {response}")
             return video_items
 
         for v in response["hits"]:
@@ -364,12 +522,6 @@ def search_videos_coverr(
 
             width = int(v.get("width", 0) or 0)
             height = int(v.get("height", 0) or 0)
-            if width > 0 and height > 0:
-                clip_ratio = width / height
-                target_ratio = video_width / video_height
-                if abs(clip_ratio - target_ratio) / max(target_ratio, 0.01) > 0.15:
-                    logger.debug(f"  coverr: skipping clip with ratio {clip_ratio:.3f} (target {target_ratio:.3f})")
-                    continue
 
             item = MaterialInfo()
             item.provider = "coverr"
@@ -377,7 +529,11 @@ def search_videos_coverr(
             item.duration = duration
             item.width = width
             item.height = height
-            item.tags = ", ".join(v.get("tags", []) or []) if isinstance(v.get("tags"), list) else str(v.get("tags", ""))
+            item.tags = (
+                ", ".join(v.get("tags", []) or [])
+                if isinstance(v.get("tags"), list)
+                else str(v.get("tags", ""))
+            )
             item.description = v.get("description", "") or v.get("name", "") or ""
             video_items.append(item)
         return video_items
@@ -422,28 +578,114 @@ def _score_clip_quality(
     return score
 
 
-_LOW_INFORMATION_WORDS = frozenset({
-    "stock", "footage", "video", "videos", "background", "royalty", "free",
-    "hd", "4k", "motion", "loop", "animation", "template", "after", "effects",
-    "download", "clip", "clips", "media", "file", "files", "pro", "premium",
-    "videvo", "videezy", "mixkit", "coverr", "pexels", "pixabay",
-    "footage", "videohive", "shutterstock", "getty",
-})
+_LOW_INFORMATION_WORDS = frozenset(
+    {
+        "stock",
+        "footage",
+        "video",
+        "videos",
+        "background",
+        "royalty",
+        "free",
+        "hd",
+        "4k",
+        "motion",
+        "loop",
+        "animation",
+        "template",
+        "after",
+        "effects",
+        "download",
+        "clip",
+        "clips",
+        "media",
+        "file",
+        "files",
+        "pro",
+        "premium",
+        "videvo",
+        "videezy",
+        "mixkit",
+        "coverr",
+        "pexels",
+        "pixabay",
+        "footage",
+        "videohive",
+        "shutterstock",
+        "getty",
+    }
+)
+
+# Shot-type hints that the LLM tends to prepend/append to search terms
+# (e.g. "close up doctor using digital tablet", "aerial view city skyline").
+# These describe HOW to shoot, not WHAT is in the frame, so they shouldn't
+# be required to appear in the stock clip's tags/description for the clip to
+# be considered relevant.
+_SHOT_TYPE_WORDS = frozenset(
+    {
+        "close",
+        "up",
+        "wide",
+        "shot",
+        "angle",
+        "aerial",
+        "view",
+        "dolly",
+        "tracking",
+        "tracking shot",
+        "pan",
+        "tilt",
+        "zoom",
+        "macro",
+        "cinematic",
+        "handheld",
+        "steady",
+        "stabilized",
+        "bokeh",
+        "slow",
+        "fast",
+        "dollying",
+        "panning",
+        "tilting",
+    }
+)
+
+
+def _split_content_words(text: str) -> List[str]:
+    """
+    Tokenise text into a list of lowercase word-boundary tokens,
+    filtering out low-information and shot-type words.
+
+    Used to compare the *semantic content* of a search term against a clip's
+    metadata, ignoring generic stock-site fluff and shot-type hints that are
+    unlikely to appear in provider tags.
+    """
+    if not text:
+        return []
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return [
+        t
+        for t in tokens
+        if t not in _LOW_INFORMATION_WORDS and t not in _SHOT_TYPE_WORDS
+    ]
 
 
 def _calculate_relevance_score(item: MaterialInfo, search_term: str) -> float:
     """
     Score a clip by how relevant its metadata is to the search term.
 
-    Uses keyword overlap between the search term and clip tags/description.
-    Penalises clips whose metadata consists mostly of generic/low-information
-    words (e.g. "stock", "background", "4k") that don't describe actual content.
-    Returns 0-100 score.
+    Uses keyword overlap between the search term's content words and the
+    clip's tags/description, ignoring generic stock-site fluff and shot-type
+    hints. Returns 0-100 score.
+
+    Improved scoring:
+    - Higher weight for exact phrase matches in description
+    - Boost for multiple distinct content word matches
+    - Penalty for generic metadata
     """
     if not search_term:
         return 0.0
-
-    term_words = set(search_term.lower().split())
+    term_words = _split_content_words(search_term)
     if not term_words:
         return 0.0
 
@@ -451,54 +693,235 @@ def _calculate_relevance_score(item: MaterialInfo, search_term: str) -> float:
     if not metadata_text.strip():
         return 0.0
 
-    matches = sum(1 for word in term_words if word in metadata_text)
-    coverage = matches / len(term_words)
-    score = coverage * 100.0
+    metadata_tokens = set(re.findall(r"[a-z0-9]+", metadata_text))
+    matched = sum(1 for w in term_words if w in metadata_tokens)
+    coverage = matched / len(term_words)
 
-    metadata_words = set(metadata_text.split())
-    content_words = metadata_words - _LOW_INFORMATION_WORDS
-    if len(metadata_words) > 0:
-        info_ratio = len(content_words) / len(metadata_words)
+    content_metadata_words = metadata_tokens - _LOW_INFORMATION_WORDS
+    if metadata_tokens:
+        info_ratio = len(content_metadata_words) / len(metadata_tokens)
         if info_ratio < 0.3:
-            score *= 0.5
+            coverage *= 0.5
 
-    return min(score, 100.0)
+    # Boost for multiple distinct matches (more specific relevance)
+    if matched >= 3:
+        coverage *= 1.3
+    elif matched >= 2:
+        coverage *= 1.15
+
+    # Small boost if search term appears as phrase in description
+    if len(term_words) >= 2 and search_term.lower() in (item.description or "").lower():
+        coverage *= 1.2
+
+    return min(coverage * 100.0, 100.0)
 
 
-def _is_clip_relevant(item: MaterialInfo, search_term: str, min_relevance: float = 0.4) -> bool:
+def _is_clip_relevant(item: MaterialInfo, search_term: str) -> bool:
     """
     Check if a clip's metadata is at least minimally relevant to the search term.
 
-    Uses word-boundary keyword overlap. Clips without tags/description are rejected
-    because we cannot verify their relevance to the topic.
+    The filter now uses a configurable threshold to balance precision vs recall.
+    Configure via config.app.clip_relevance_threshold:
+      - "strict"  : require 2+ matching content words (or 1 for very short terms)
+      - "balanced": require 1+ matching content words (default, current behavior)
+      - "lenient" : accept if any word matches (including low-info words)
+
+    This addresses the "irrelevant clips" complaint by making the default
+    stricter while keeping lenient mode available for niche topics.
     """
     if not item.tags and not item.description:
         return False
     if not search_term:
         return False
 
-    term_words = search_term.lower().split()
+    term_words = _split_content_words(search_term)
+    if not term_words:
+        # Search term was pure fluff ("stock footage", "aerial view") —
+        # accept the clip rather than fail to fill the timeline, since we
+        # cannot meaningfully compare content.
+        return True
+
+    # Read relevance threshold from config (default: "balanced")
+    relevance_mode = str(config.app.get("clip_relevance_threshold", "balanced")).strip().lower()
+
     metadata_text = f"{item.tags} {item.description}".lower()
     if not metadata_text.strip():
         return False
 
-    matches = 0
+    metadata_tokens = set(re.findall(r"[a-z0-9]+", metadata_text))
+    matched = 0
     for word in term_words:
-        if re.search(rf"\b{re.escape(word)}\b", metadata_text):
-            matches += 1
-    score = matches / len(term_words)
-    return score >= min_relevance
+        if word in metadata_tokens:
+            matched += 1
+
+    if relevance_mode == "strict":
+        # Require at least 2 matches for longer terms, 1 for short terms
+        required = 2 if len(term_words) >= 3 else 1
+        return matched >= required
+    elif relevance_mode == "lenient":
+        # Accept if any token from original search term matches (including low-info)
+        all_tokens = set(re.findall(r"[a-z0-9]+", search_term.lower()))
+        return any(t in metadata_tokens for t in all_tokens)
+    else:  # balanced (default)
+        return matched > 0
+
+
+def _calculate_relevance_score(item: MaterialInfo, search_term: str) -> float:
+    """
+    Score a clip by how relevant its metadata is to the search term.
+
+    Uses keyword overlap between the search term's content words and the
+    clip's tags/description, ignoring generic stock-site fluff and shot-type
+    hints. Returns 0-100 score.
+
+    Improved scoring:
+    - Higher weight for exact phrase matches in description
+    - Boost for multiple distinct content word matches
+    - Penalty for generic metadata
+    """
+    if not search_term:
+        return 0.0
+    term_words = _split_content_words(search_term)
+    if not term_words:
+        return 0.0
+
+    metadata_text = f"{item.tags} {item.description}".lower()
+    if not metadata_text.strip():
+        return 0.0
+
+    metadata_tokens = set(re.findall(r"[a-z0-9]+", metadata_text))
+    matched = sum(1 for w in term_words if w in metadata_tokens)
+    coverage = matched / len(term_words)
+
+    content_metadata_words = metadata_tokens - _LOW_INFORMATION_WORDS
+    if metadata_tokens:
+        info_ratio = len(content_metadata_words) / len(metadata_tokens)
+        if info_ratio < 0.3:
+            coverage *= 0.5
+
+    # Boost for multiple distinct matches (more specific relevance)
+    if matched >= 3:
+        coverage *= 1.3
+    elif matched >= 2:
+        coverage *= 1.15
+
+    # Small boost if search term appears as phrase in description
+    if len(term_words) >= 2 and search_term.lower() in (item.description or "").lower():
+        coverage *= 1.2
+
+    return min(coverage * 100.0, 100.0)
+
+
+# =============================================================================
+# Semantic Relevance (Embedding-based)
+# =============================================================================
+
+_EMBEDDING_MODEL = None
+_EMBEDDING_MODEL_NAME = None
+
+
+def _get_embedding_model():
+    """
+    Lazily load the sentence transformer model for semantic similarity.
+    Falls back gracefully if not available.
+    """
+    global _EMBEDDING_MODEL, _EMBEDDING_MODEL_NAME
+
+    model_name = str(
+        config.app.get("clip_embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
+    ).strip()
+
+    if _EMBEDDING_MODEL is not None and _EMBEDDING_MODEL_NAME == model_name:
+        return _EMBEDDING_MODEL
+
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        logger.info(f"Loading embedding model: {model_name}")
+        _EMBEDDING_MODEL = SentenceTransformer(model_name)
+        _EMBEDDING_MODEL_NAME = model_name
+        return _EMBEDDING_MODEL
+    except Exception as e:
+        logger.warning(f"Failed to load embedding model '{model_name}': {e}")
+        logger.warning("Falling back to keyword-based relevance scoring only")
+        _EMBEDDING_MODEL = None
+        return None
+
+
+def _calculate_semantic_relevance(item: MaterialInfo, search_term: str) -> float:
+    """
+    Calculate semantic similarity between search term and clip metadata using embeddings.
+
+    Returns 0-100 score based on cosine similarity.
+    Falls back to 0 if embedding model unavailable.
+    """
+    model = _get_embedding_model()
+    if model is None:
+        return 0.0
+
+    if not search_term or (not item.tags and not item.description):
+        return 0.0
+
+    try:
+        metadata_text = f"{item.tags} {item.description}".strip()
+        if not metadata_text:
+            return 0.0
+
+        # Embed both texts
+        embeddings = model.encode([search_term, metadata_text], convert_to_numpy=True, normalize_embeddings=True)
+        term_emb, clip_emb = embeddings[0], embeddings[1]
+
+        # Cosine similarity (since embeddings are normalized)
+        similarity = float(np.dot(term_emb, clip_emb))
+        # Convert to 0-100 score
+        score = max(0.0, min(100.0, (similarity + 1.0) * 50.0))
+
+        return score
+    except Exception as e:
+        logger.debug(f"Semantic relevance calculation failed: {e}")
+        return 0.0
+
+
+def _calculate_combined_relevance(item: MaterialInfo, search_term: str) -> float:
+    """
+    Calculate combined relevance score using both keyword and semantic similarity.
+
+    Weighted combination:
+    - keyword_relevance (existing logic): 40%
+    - semantic_relevance (embedding-based): 60%
+
+    Falls back gracefully if embedding model unavailable.
+    """
+    keyword_score = _calculate_relevance_score(item, search_term)
+
+    semantic_enabled = bool(config.app.get("semantic_search_enabled", True))
+    if not semantic_enabled:
+        return keyword_score
+
+    semantic_score = _calculate_semantic_relevance(item, search_term)
+
+    if semantic_score == 0.0:
+        # Embedding unavailable, use keyword only
+        return keyword_score
+
+    # Weighted combination
+    combined = 0.4 * keyword_score + 0.6 * semantic_score
+    return min(combined, 100.0)
 
 
 def _verify_clip_with_twelvelabs(item: MaterialInfo, search_term: str) -> bool:
     """
-    Verify clip relevance using TwelveLabs Pegasus (opt-in via API key).
+    Verify clip relevance using TwelveLabs Pegasus (opt-in via API key + config).
 
     Returns True if:
       - TwelveLabs is not configured (graceful degradation)
+      - Clip verification is disabled in config
       - The model confirms the clip matches the search term
     Returns False if the model indicates the clip is not relevant.
     """
+    # Check if clip verification is explicitly enabled in config
+    if not config.app.get("twelvelabs_verify_clips", False):
+        return True
     if not twelvelabs.is_enabled():
         return True
     if not item.url:
@@ -541,7 +964,11 @@ def download_videos_by_paragraphs(
 
     Returns a flat list of video paths in paragraph order: [p1_clip1, p1_clip2, p2_clip1, ...]
     """
-    aspect_enum = VideoAspect(video_aspect) if not isinstance(video_aspect, VideoAspect) else video_aspect
+    aspect_enum = (
+        VideoAspect(video_aspect)
+        if not isinstance(video_aspect, VideoAspect)
+        else video_aspect
+    )
     target_width, target_height = aspect_enum.to_resolution()
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":
@@ -602,18 +1029,30 @@ def download_videos_by_paragraphs(
                 continue
 
             scored = []
+            rejected_relevance = 0
             for item in items:
                 if item.url in seen_urls:
                     continue
                 if not _is_clip_relevant(item, original_term):
+                    rejected_relevance += 1
+                    logger.info(
+                        f"  [reject] para {para_idx + 1} term '{original_term}': "
+                        f"clip not relevant. tags='{item.tags}' desc='{item.description[:80]}'"
+                    )
                     continue
                 seen_urls.add(item.url)
                 score = _score_clip_quality(item, target_width, target_height)
-                scored.append((score, item))
+                relevance = _calculate_combined_relevance(item, original_term)
+                logger.info(
+                    f"  [accept] para {para_idx + 1} term '{original_term}': "
+                    f"quality={score:.0f} relevance={relevance:.0f} "
+                    f"tags='{item.tags}' url={item.url}"
+                )
+                scored.append((score, relevance, item))
 
-            scored.sort(key=lambda x: x[0], reverse=True)
+            scored.sort(key=lambda x: (x[0] * 0.5 + x[1] * 0.5), reverse=True)
 
-            for score, item in scored:
+            for score, relevance, item in scored:
                 if para_duration >= para_budget:
                     break
                 if not _verify_clip_with_twelvelabs(item, original_term):
@@ -647,7 +1086,9 @@ def download_videos_by_paragraphs(
                         duration=max_clip_duration * 2,
                     )
                     if generated:
-                        saved = save_video(video_url=generated.url, save_dir=material_directory)
+                        saved = save_video(
+                            video_url=generated.url, save_dir=material_directory
+                        )
                         if saved:
                             para_downloaded.append(saved)
                             para_duration += min(max_clip_duration, generated.duration)
@@ -658,6 +1099,16 @@ def download_videos_by_paragraphs(
             f"paragraph {para_idx + 1}: downloaded {len(para_downloaded)} clips "
             f"({para_duration:.1f}s / {para_budget:.1f}s budget)"
         )
+        if para_duration < para_budget * 0.5:
+            logger.warning(
+                f"paragraph {para_idx + 1} is under-filled "
+                f"({para_duration:.1f}s vs {para_budget:.1f}s target). "
+                f"Possible causes: few stock results for these terms, "
+                f"all clips rejected as irrelevant, or ComfyUI fallback "
+                f"disabled/unconfigured. Check per-clip [accept]/[reject] "
+                f"logs above and consider adjusting the LLM terms or "
+                f"enabling TwelveLabs verification."
+            )
         all_video_paths.extend(para_downloaded)
 
     logger.success(
@@ -683,17 +1134,199 @@ def download_videos_by_paragraphs(
     return all_video_paths
 
 
+def download_videos_by_sentences(
+    task_id: str,
+    sentence_terms: List[List[str]],
+    source: str = "auto",
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    audio_duration: float = 0.0,
+    max_clip_duration: int = 5,
+    sentence_audio_durations: List[float] | None = None,
+    use_comfyui_fallback: bool = False,
+) -> List[str]:
+    """
+    Download video clips for EACH SENTENCE of the script independently.
+
+    Each sentence gets its own time budget and search terms. This ensures
+    that visuals change with each sentence of narration, providing
+    the tightest possible alignment between script and visuals.
+
+    Returns a flat list of video paths in sentence order:
+    [s1_clip1, s1_clip2, s2_clip1, s2_clip2, ...]
+    """
+    aspect_enum = (
+        VideoAspect(video_aspect)
+        if not isinstance(video_aspect, VideoAspect)
+        else video_aspect
+    )
+    target_width, target_height = aspect_enum.to_resolution()
+    material_directory = config.app.get("material_directory", "").strip()
+    if material_directory == "task":
+        material_directory = utils.task_dir(task_id)
+    elif material_directory and not os.path.isdir(material_directory):
+        material_directory = ""
+    if not material_directory:
+        material_directory = utils.storage_dir("cache_videos")
+    os.makedirs(material_directory, exist_ok=True)
+
+    if sentence_audio_durations is None:
+        num_sentences = max(len(sentence_terms), 1)
+        per_sent_duration = audio_duration / num_sentences
+        sentence_audio_durations = [per_sent_duration] * len(sentence_terms)
+
+    search_fn = search_videos_auto
+    if source == "pexels":
+        search_fn = search_videos_pexels
+    elif source == "pixabay":
+        search_fn = search_videos_pixabay
+    elif source == "coverr":
+        search_fn = search_videos_coverr
+    elif source == "comfyui":
+        search_fn = search_videos_comfyui
+
+    all_video_paths: List[str] = []
+    total_sentences = len(sentence_terms)
+
+    for sent_idx, terms in enumerate(sentence_terms):
+        if not terms:
+            logger.warning(f"sentence {sent_idx + 1} has no search terms, skipping")
+            continue
+
+        sent_budget = sentence_audio_durations[sent_idx]
+        logger.info(
+            f"sentence {sent_idx + 1}/{total_sentences}: "
+            f"budget={sent_budget:.1f}s, terms={terms}"
+        )
+
+        sent_downloaded: List[str] = []
+        sent_duration = 0.0
+        seen_urls: set = set()
+
+        term_pairs = _normalize_search_terms(terms)
+
+        for normalized_term, original_term in term_pairs:
+            if sent_duration >= sent_budget:
+                break
+
+            try:
+                items = search_fn(
+                    search_term=normalized_term,
+                    minimum_duration=max_clip_duration,
+                    video_aspect=video_aspect,
+                )
+            except Exception as e:
+                logger.warning(f"search failed for '{normalized_term}': {e}")
+                continue
+
+            scored = []
+            for item in items:
+                if item.url in seen_urls:
+                    continue
+                if not _is_clip_relevant(item, original_term):
+                    continue
+                seen_urls.add(item.url)
+                score = _score_clip_quality(item, target_width, target_height)
+                relevance = _calculate_combined_relevance(item, original_term)
+                logger.info(
+                    f"  [accept] sent {sent_idx + 1} term '{original_term}': "
+                    f"quality={score:.0f} relevance={relevance:.0f} "
+                    f"tags='{item.tags}' url={item.url}"
+                )
+                scored.append((score, relevance, item))
+
+            scored.sort(key=lambda x: (x[0] * 0.5 + x[1] * 0.5), reverse=True)
+
+            for score, relevance, item in scored:
+                if sent_duration >= sent_budget:
+                    break
+                if not _verify_clip_with_twelvelabs(item, original_term):
+                    logger.debug(f"  skipping clip (TwelveLabs rejected): {item.url}")
+                    continue
+                try:
+                    saved = save_video(video_url=item.url, save_dir=material_directory)
+                    if saved:
+                        sent_downloaded.append(saved)
+                        sent_duration += min(max_clip_duration, item.duration)
+                        logger.debug(
+                            f"  sent {sent_idx + 1}: added clip "
+                            f"({sent_duration:.1f}/{sent_budget:.1f}s)"
+                        )
+                except Exception as e:
+                    logger.warning(f"failed to download '{original_term}' clip: {e}")
+
+        if sent_duration < sent_budget * 0.5 and use_comfyui_fallback:
+            logger.info(
+                f"sentence {sent_idx + 1}: only {sent_duration:.1f}s of "
+                f"{sent_budget:.1f}s, trying ComfyUI fallback"
+            )
+            for pair in term_pairs[:2]:
+                if sent_duration >= sent_budget:
+                    break
+                term = pair[0]
+                try:
+                    generated = generate_video_comfyui(
+                        prompt=term,
+                        video_aspect=video_aspect,
+                        duration=max_clip_duration * 2,
+                    )
+                    if generated:
+                        saved = save_video(
+                            video_url=generated.url, save_dir=material_directory
+                        )
+                        if saved:
+                            sent_downloaded.append(saved)
+                            sent_duration += min(max_clip_duration, generated.duration)
+                except Exception as e:
+                    logger.warning(f"ComfyUI fallback failed for '{term}': {e}")
+
+        logger.info(
+            f"sentence {sent_idx + 1}: downloaded {len(sent_downloaded)} clips "
+            f"({sent_duration:.1f}s / {sent_budget:.1f}s budget)"
+        )
+        if sent_duration < sent_budget * 0.5:
+            logger.warning(
+                f"sentence {sent_idx + 1} is under-filled "
+                f"({sent_duration:.1f}s vs {sent_budget:.1f}s target). "
+                f"Check per-clip [accept]/[reject] logs above."
+            )
+        all_video_paths.extend(sent_downloaded)
+
+    logger.success(
+        f"downloaded {len(all_video_paths)} total clips across "
+        f"{total_sentences} sentences"
+    )
+
+    # Add AI-generated clips if enabled
+    all_terms = [t for terms in sentence_terms for t in terms]
+    ai_paths = image_gen.generate_ai_clips(
+        prompts=all_terms,
+        save_dir=material_directory,
+        video_aspect=video_aspect,
+        clip_duration=max_clip_duration,
+        max_clips=config.app.get("ai_image_clips_count", 2),
+    )
+    if ai_paths:
+        all_video_paths = image_gen.interleave_clips(
+            stock_paths=all_video_paths,
+            ai_paths=ai_paths,
+            every_n=config.app.get("ai_clip_interleave_every", 4),
+        )
+
+    return all_video_paths
+
+
 def _normalize_search_terms(search_terms: List[str]) -> List[tuple[str, str]]:
     """
     Expand short/generic search terms to improve stock API results.
 
-    Short queries (1 word) often return poor results. This adds a visual
-    modifier to help the API return usable footage.
+    Short queries (1-2 words) often return poor results. This adds visual
+    context words to help the API return usable footage, but avoids diluting
+    the search intent with generic "stock video footage" terms.
 
     Returns list of (normalized_term, original_term) pairs so callers can
     use the original term for relevance checking.
     """
-    visual_modifiers = ["footage", "video", "scene"]
+    visual_modifiers = ["footage", "video", "scene", "close up", "wide shot"]
     result: list[tuple[str, str]] = []
     for term in search_terms:
         original = term.strip()
@@ -702,7 +1335,8 @@ def _normalize_search_terms(search_terms: List[str]) -> List[tuple[str, str]]:
         if word_count <= 2:
             has_modifier = any(m in normalized.lower() for m in visual_modifiers)
             if not has_modifier:
-                normalized = f"{normalized} stock video footage"
+                # Add visual context without generic stock terms
+                normalized = f"{normalized} footage"
         result.append((normalized, original))
     return result
 
@@ -735,12 +1369,21 @@ def search_videos_auto(
         providers.append(("pixabay", search_videos_pixabay))
 
     coverr_keys = config.app.get("coverr_api_keys")
-    if coverr_keys:
+    # Cubrir todas las claves de Coverr suele ser contraproducente: la API de
+    # Coverr aplica rate-limit (429) incluso con pocas requests concurrentes, lo
+    # que en modo auto lastra la búsqueda y dispara falsos negativos en el
+    # filtro de aspect ratio. Solo lo añadimos si el operador lo solicita
+    # explícitamente vía allow_coverr_in_auto (=true en config).
+    if coverr_keys and bool(config.app.get("allow_coverr_in_auto", False)):
         providers.append(("coverr", search_videos_coverr))
 
     if not providers:
-        logger.error("no video providers configured for auto mode (need at least one API key)")
+        logger.error(
+            "no video providers configured for auto mode (need at least one API key)"
+        )
         return []
+
+    logger.info(f"[auto] searching '{search_term}' across {len(providers)} providers: {[p[0] for p in providers]}")
 
     for provider_name, search_fn in providers:
         try:
@@ -749,12 +1392,15 @@ def search_videos_auto(
                 minimum_duration=minimum_duration,
                 video_aspect=video_aspect,
             )
+            logger.info(f"[auto] provider '{provider_name}' returned {len(items)} items")
             for item in items:
                 if item.url and item.url not in seen_urls:
                     seen_urls.add(item.url)
                     q_score = _score_clip_quality(item, target_width, target_height)
                     r_score = _calculate_relevance_score(item, search_term)
-                    item.tags = f"{item.tags} _quality_{q_score:.0f}_relevance_{r_score:.0f}"
+                    item.tags = (
+                        f"{item.tags} _quality_{q_score:.0f}_relevance_{r_score:.0f}"
+                    )
                     all_items.append(item)
             logger.info(
                 f"auto provider '{provider_name}' returned {len(items)} items "
@@ -765,11 +1411,19 @@ def search_videos_auto(
 
     all_items.sort(
         key=lambda x: (
-            float(x.tags.split("_quality_")[1].split("_")[0]) if "_quality_" in x.tags else 0
-        ) * 0.5
-        + (
-            float(x.tags.split("_relevance_")[1].split("_")[0]) if "_relevance_" in x.tags else 0
-        ) * 0.5,
+            (
+                float(x.tags.split("_quality_")[1].split("_")[0])
+                if "_quality_" in x.tags
+                else 0
+            )
+            * 0.5
+            + (
+                float(x.tags.split("_relevance_")[1].split("_")[0])
+                if "_relevance_" in x.tags
+                else 0
+            )
+            * 0.5
+        ),
         reverse=True,
     )
 
@@ -856,7 +1510,9 @@ def generate_video_comfyui(
             endpoint_host = base_url.split("/", 3)[2] if "/" in base_url else base_url
             video_url = f"{base_url.rstrip('/')}/{video_url.lstrip('/')}"
             if video_url.split("/", 3)[2] != endpoint_host:
-                logger.warning(f"skip ComfyUI generated clip with unexpected host: {video_url}")
+                logger.warning(
+                    f"skip ComfyUI generated clip with unexpected host: {video_url}"
+                )
                 return None
 
         item = MaterialInfo()
@@ -946,6 +1602,7 @@ def download_videos(
     match_script_order: bool = False,
     use_comfyui_fallback: bool = False,
 ) -> List[str]:
+    logger.info(f"[download_videos] task_id={task_id}, source={source}, terms={search_terms}, audio_duration={audio_duration}")
     search_videos = search_videos_pexels
     if source == "pixabay":
         search_videos = search_videos_pixabay
@@ -973,7 +1630,11 @@ def download_videos(
             material_directory=material_directory,
         )
 
-    aspect_enum = VideoAspect(video_aspect) if not isinstance(video_aspect, VideoAspect) else video_aspect
+    aspect_enum = (
+        VideoAspect(video_aspect)
+        if not isinstance(video_aspect, VideoAspect)
+        else video_aspect
+    )
     target_width, target_height = aspect_enum.to_resolution()
 
     normalized_pairs = _normalize_search_terms(search_terms)
@@ -994,20 +1655,28 @@ def download_videos(
             if item.url in valid_video_urls:
                 continue
             if not _is_clip_relevant(item, original_term):
-                logger.debug(f"  skipping clip (not relevant): {item.url}")
+                logger.info(
+                    f"  [reject] term '{original_term}': clip not relevant. "
+                    f"tags='{item.tags}' desc='{item.description[:80]}'"
+                )
                 continue
-            if not _verify_clip_with_twelvelabs(item, search_term):
+            if not _verify_clip_with_twelvelabs(item, original_term):
                 logger.debug(f"  skipping clip (TwelveLabs rejected): {item.url}")
                 continue
             valid_video_urls.add(item.url)
             score = _score_clip_quality(item, target_width, target_height)
-            scored_items.append((score, item))
+            relevance = _calculate_combined_relevance(item, original_term)
+            logger.info(
+                f"  [accept] term '{original_term}': quality={score:.0f} relevance={relevance:.0f} "
+                f"tags='{item.tags}' url={item.url}"
+            )
+            scored_items.append((score, relevance, item))
             found_duration += item.duration
 
-        scored_items.sort(key=lambda x: x[0], reverse=True)
+        scored_items.sort(key=lambda x: (x[0] * 0.5 + x[1] * 0.5), reverse=True)
 
         if scored_items:
-            term_groups.append((search_term, scored_items))
+            term_groups.append((original_term, scored_items))
 
     logger.info(
         f"found total videos across {len(term_groups)} term groups, "
@@ -1022,7 +1691,7 @@ def download_videos(
     for round_idx in range(max_rounds):
         for _, items in term_groups:
             if round_idx < len(items):
-                round_robin_pool.append(items[round_idx][1])
+                round_robin_pool.append(items[round_idx][2])
 
     if concat_mode_value == VideoConcatMode.random.value:
         random.shuffle(round_robin_pool)
@@ -1048,7 +1717,9 @@ def download_videos(
             logger.error(f"failed to download video: {utils.to_json(item)} => {str(e)}")
 
     # ComfyUI fallback: if we got few or no clips, try generating custom ones
-    if use_comfyui_fallback and (len(video_paths) < 2 or total_duration < audio_duration * 0.5):
+    if use_comfyui_fallback and (
+        len(video_paths) < 2 or total_duration < audio_duration * 0.5
+    ):
         comfy_generated = 0
         for search_term in search_terms:
             if total_duration >= audio_duration:
@@ -1061,17 +1732,23 @@ def download_videos(
                     duration=max_clip_duration * 2,
                 )
                 if generated:
-                    saved = save_video(video_url=generated.url, save_dir=material_directory)
+                    saved = save_video(
+                        video_url=generated.url, save_dir=material_directory
+                    )
                     if saved:
                         video_paths.append(saved)
                         total_duration += min(max_clip_duration, generated.duration)
                         comfy_generated += 1
-                        logger.success(f"ComfyUI fallback generated clip {comfy_generated}: {saved}")
+                        logger.success(
+                            f"ComfyUI fallback generated clip {comfy_generated}: {saved}"
+                        )
             except Exception as e:
                 logger.warning(f"ComfyUI fallback failed for '{search_term}': {e}")
 
         if comfy_generated:
-            logger.success(f"ComfyUI fallback generated {comfy_generated} additional clips")
+            logger.success(
+                f"ComfyUI fallback generated {comfy_generated} additional clips"
+            )
 
     ai_paths = image_gen.generate_ai_clips(
         prompts=search_terms,
@@ -1127,7 +1804,10 @@ def _download_videos_by_script_order(
             if item.url in valid_video_urls:
                 continue
             if not _is_clip_relevant(item, search_term):
-                logger.debug(f"  skipping clip (not relevant): {item.url}")
+                logger.info(
+                    f"  [reject] term '{search_term}': clip not relevant. "
+                    f"tags='{item.tags}' desc='{item.description[:80]}'"
+                )
                 continue
             if not _verify_clip_with_twelvelabs(item, search_term):
                 logger.debug(f"  skipping clip (TwelveLabs rejected): {item.url}")
@@ -1135,6 +1815,9 @@ def _download_videos_by_script_order(
             term_items.append(item)
             valid_video_urls.add(item.url)
             found_duration += item.duration
+            logger.info(
+                f"  [accept] term '{search_term}': tags='{item.tags}' url={item.url}"
+            )
 
         if term_items:
             candidate_groups.append((search_term, term_items))

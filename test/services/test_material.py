@@ -51,7 +51,9 @@ class TestMaterialTlsVerification(unittest.TestCase):
             }
         )
 
-        with patch("app.services.material.requests.get", return_value=fake_response) as get:
+        with patch(
+            "app.services.material.requests.get", return_value=fake_response
+        ) as get:
             results = material.search_videos_pexels("cat", minimum_duration=1)
 
         self.assertEqual(len(results), 1)
@@ -82,7 +84,9 @@ class TestMaterialTlsVerification(unittest.TestCase):
             }
         )
 
-        with patch("app.services.material.requests.get", return_value=fake_response) as get:
+        with patch(
+            "app.services.material.requests.get", return_value=fake_response
+        ) as get:
             results = material.search_videos_pixabay("cat", minimum_duration=1)
 
         self.assertEqual(len(results), 1)
@@ -105,9 +109,12 @@ class TestMaterialTlsVerification(unittest.TestCase):
                 return None
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            with patch(
-                "app.services.material.requests.get", return_value=fake_response
-            ) as get, patch("app.services.material.VideoFileClip", FakeVideoFileClip):
+            with (
+                patch(
+                    "app.services.material.requests.get", return_value=fake_response
+                ) as get,
+                patch("app.services.material.VideoFileClip", FakeVideoFileClip),
+            ):
                 video_path = material.save_video(
                     "https://example.com/video.mp4?token=abc", save_dir=temp_dir
                 )
@@ -137,12 +144,36 @@ class TestMaterialTlsVerification(unittest.TestCase):
         """
         search_results = {
             "opening city": [
-                material.MaterialInfo(provider="pexels", url="https://v.example/a1.mp4", duration=3),
-                material.MaterialInfo(provider="pexels", url="https://v.example/a2.mp4", duration=3),
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/a1.mp4",
+                    duration=3,
+                    tags="opening city skyline",
+                    description="opening city",
+                ),
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/a2.mp4",
+                    duration=3,
+                    tags="opening city street",
+                    description="opening city",
+                ),
             ],
             "middle office": [
-                material.MaterialInfo(provider="pexels", url="https://v.example/b1.mp4", duration=3),
-                material.MaterialInfo(provider="pexels", url="https://v.example/b2.mp4", duration=3),
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/b1.mp4",
+                    duration=3,
+                    tags="middle office desk",
+                    description="middle office",
+                ),
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/b2.mp4",
+                    duration=3,
+                    tags="middle office team",
+                    description="middle office",
+                ),
             ],
         }
         downloaded_urls = []
@@ -177,6 +208,143 @@ class TestMaterialTlsVerification(unittest.TestCase):
             ],
         )
         self.assertEqual(result, ["/tmp/a1.mp4", "/tmp/b1.mp4", "/tmp/a2.mp4"])
+
+    def test_download_videos_legacy_path_does_not_raise_unbound_local(self):
+        """
+        Regression: the legacy `download_videos()` path (when
+        `match_script_order=False`) referenced a `search_term` variable that
+        did not exist in that scope, raising UnboundLocalError and aborting
+        the relevance filter before any clip could be downloaded.
+
+        With the fix, calling download_videos() without match_script_order
+        should successfully filter by relevance and return saved paths.
+        """
+        fake_item = material.MaterialInfo(
+            provider="pexels",
+            url="https://v.example/clip.mp4",
+            duration=10,
+            tags="city skyline",
+            description="city skyline aerial",
+        )
+
+        with (
+            patch.dict(config.app, {"material_directory": ""}),
+            patch.object(material, "search_videos_pexels", return_value=[fake_item]),
+            patch.object(material, "save_video", return_value="/tmp/clip.mp4"),
+            patch.object(material, "image_gen") as fake_image_gen,
+        ):
+            fake_image_gen.generate_ai_clips.return_value = []
+            result = material.download_videos(
+                task_id="legacy-path",
+                search_terms=["city skyline"],
+                source="pexels",
+                audio_duration=5,
+                max_clip_duration=5,
+                match_script_order=False,
+            )
+
+        self.assertEqual(result, ["/tmp/clip.mp4"])
+
+    def test_download_videos_legacy_path_filters_irrelevant_clips(self):
+        """
+        The legacy `download_videos()` path should still apply the relevance
+        filter (regression: pre-fix it skipped the filter entirely via the
+        UnboundLocalError) so that clips unrelated to the term are rejected.
+        """
+        relevant = material.MaterialInfo(
+            provider="pexels",
+            url="https://v.example/rel.mp4",
+            duration=10,
+            tags="doctor hospital",
+            description="doctor working in hospital",
+        )
+        irrelevant = material.MaterialInfo(
+            provider="pexels",
+            url="https://v.example/unrel.mp4",
+            duration=10,
+            tags="mountain landscape hiking",
+            description="mountain hiking trail",
+        )
+
+        downloaded = []
+
+        def fake_save(video_url, save_dir=""):
+            downloaded.append(video_url)
+            return f"/tmp/{video_url.rsplit('/', 1)[-1]}"
+
+        with (
+            patch.dict(config.app, {"material_directory": ""}),
+            patch.object(
+                material,
+                "search_videos_pexels",
+                return_value=[irrelevant, relevant],
+            ),
+            patch.object(material, "save_video", side_effect=fake_save),
+            patch.object(material, "image_gen") as fake_image_gen,
+        ):
+            fake_image_gen.generate_ai_clips.return_value = []
+            result = material.download_videos(
+                task_id="filter-test",
+                search_terms=["doctor hospital"],
+                source="pexels",
+                audio_duration=8,
+                max_clip_duration=5,
+                match_script_order=False,
+            )
+
+        # Only the relevant clip should be saved; irrelevant one rejected.
+        self.assertEqual(downloaded, ["https://v.example/rel.mp4"])
+        self.assertEqual(result, ["/tmp/rel.mp4"])
+
+
+class TestClipRelevanceFilter(unittest.TestCase):
+    """Unit tests for _is_clip_relevant keyword-overlap filter."""
+
+    def _clip(self, tags="", description=""):
+        return material.MaterialInfo(
+            provider="pexels",
+            url="https://example.com/x.mp4",
+            duration=10,
+            tags=tags,
+            description=description,
+        )
+
+    def test_rejects_clip_without_metadata(self):
+        self.assertFalse(material._is_clip_relevant(self._clip(), "city skyline"))
+
+    def test_rejects_clip_with_no_content_overlap(self):
+        clip = self._clip(tags="mountain hiking", description="mountain trail")
+        self.assertFalse(material._is_clip_relevant(clip, "doctor hospital"))
+
+    def test_accepts_clip_matching_at_least_one_content_word(self):
+        # 2-term query: clip tags match one of them -> accepted.
+        clip = self._clip(tags="doctor hospital medical", description="")
+        self.assertTrue(material._is_clip_relevant(clip, "doctor operating room"))
+
+    def test_shot_type_words_are_ignored_when_computing_relevance(self):
+        # Long LLM-style term: "close up doctor using digital tablet"
+        # Clip metadata: "doctor hospital" — only "doctor" matches but
+        # "close", "up" are shot-type words, so coverage is 1/4 content words
+        # (doctor, using, digital, tablet) = 0.25. Matches == 1 -> still
+        # accepted because len(content_words) >= 1.
+        clip = self._clip(tags="doctor hospital", description="doctor")
+        self.assertTrue(
+            material._is_clip_relevant(clip, "close up doctor using digital tablet")
+        )
+
+    def test_long_term_with_zero_overlap_is_rejected(self):
+        clip = self._clip(tags="financial chart trading", description="stock market")
+        self.assertFalse(
+            material._is_clip_relevant(clip, "close up doctor using digital tablet")
+        )
+
+    def test_pure_shot_type_term_falls_back_to_accept(self):
+        """
+        If after stripping shot-type + low-info words the search term is empty,
+        accept the clip (we can't meaningfully filter on "stock footage").
+        """
+        clip = self._clip(tags="anything", description="random clip")
+        self.assertTrue(material._is_clip_relevant(clip, "stock footage video"))
 
 
 class TestCoverrProvider(unittest.TestCase):
@@ -305,9 +473,7 @@ class TestCoverrProvider(unittest.TestCase):
             }
         )
 
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ):
+        with patch("app.services.material.requests.get", return_value=fake_response):
             results = material.search_videos_coverr("x", minimum_duration=5)
 
         self.assertEqual(len(results), 1)
@@ -341,9 +507,7 @@ class TestCoverrProvider(unittest.TestCase):
             }
         )
 
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ):
+        with patch("app.services.material.requests.get", return_value=fake_response):
             results = material.search_videos_coverr("x", minimum_duration=1)
 
         self.assertEqual(len(results), 1)
@@ -360,9 +524,7 @@ class TestCoverrProvider(unittest.TestCase):
 
         # Subtest A: malformed response (no "hits" key)
         with self.subTest("malformed response"):
-            fake_response = SimpleNamespace(
-                json=lambda: {"error": "rate limited"}
-            )
+            fake_response = SimpleNamespace(json=lambda: {"error": "rate limited"})
             with patch(
                 "app.services.material.requests.get", return_value=fake_response
             ):
@@ -398,13 +560,16 @@ class TestCoverrProvider(unittest.TestCase):
         fake_item.url = "https://storage.coverr.co/videos/abc/download?token=xyz"
         fake_item.duration = 10
 
-        with patch(
-            "app.services.material.search_videos_coverr",
-            return_value=[fake_item],
-        ) as search, patch(
-            "app.services.material.save_video",
-            return_value="/tmp/coverr-saved.mp4",
-        ) as save:
+        with (
+            patch(
+                "app.services.material.search_videos_coverr",
+                return_value=[fake_item],
+            ) as search,
+            patch(
+                "app.services.material.save_video",
+                return_value="/tmp/coverr-saved.mp4",
+            ) as save,
+        ):
             result = material.download_videos(
                 task_id="t-coverr",
                 search_terms=["nature"],

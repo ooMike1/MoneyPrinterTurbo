@@ -49,6 +49,10 @@ pixabay_api_keys = []
 # Register at https://coverr.co/developers?ctx=header_navigation
 coverr_api_keys = []
 
+# deAPI.ai key for Image-to-Video generation (used when ai_i2v_provider = "deapi").
+# Get a key at https://deapi.ai/
+deapi_api_key = ""
+
 # Optional TwelveLabs integration for semantic material ranking and video QA.
 # Install the optional dependency with: uv sync --extra twelvelabs
 # Create an API key at https://playground.twelvelabs.io/
@@ -56,12 +60,21 @@ twelvelabs_api_keys = []
 # Reorder search terms using Marengo before downloading materials. This option
 # is ignored when match_materials_to_script is enabled.
 twelvelabs_rerank_terms = false
+# Verify downloaded clips match the search term using Pegasus (requires API key).
+# When enabled, clips that don't visually match the search term are rejected.
+twelvelabs_verify_clips = false
 # Optional model overrides. Uncomment only when a different model is required.
 # twelvelabs_marengo_model = "marengo3.0"
 # twelvelabs_pegasus_model = "pegasus1.5"
 
+# Clip relevance filtering strictness:
+#   - "strict"  : require 2+ matching content words (1 for very short terms)
+#   - "balanced": require 1+ matching content words (default)
+#   - "lenient" : accept any word match including low-information words
+clip_relevance_threshold = "balanced"
+
 # Match search terms and downloaded materials to the script narrative order.
-# 默认关闭，开启后会减少随机性，使素材顺序更贴近文案结构。
+# Default off; enabling reduces randomness and makes clip order follow the script.
 match_materials_to_script = false
 
 # Optional Sonilo video-matched original background music.
@@ -224,6 +237,30 @@ subtitle_provider = "edge"
 # Available values: "libx264", "h264_nvenc", "h264_amf", "h264_qsv",
 # "h264_mf", "h264_videotoolbox".
 # video_codec = "libx264"
+
+# -----------------------------------------------------------------------------
+# AI Image/Video Generation / AI 图像/视频生成
+# -----------------------------------------------------------------------------
+
+# Enable AI-generated image clips (Pollinations.ai -> Ken Burns animation).
+ai_image_clips_enabled = true
+# Number of AI clips to generate per video.
+ai_image_clips_count = 2
+# Interleave AI clips every N stock clips (0 = append at end).
+ai_clip_interleave_every = 4
+# Ken Burns zoom strength for AI clips (0.0-0.3, higher = more zoom).
+ai_ken_burns_strength = 0.08
+# AI video generation provider: "moviepy" (local Ken Burns) or "deapi" (cloud I2V).
+# Requires deapi_api_key when set to "deapi".
+ai_i2v_provider = "moviepy"
+
+# Maximum concurrent deAPI I2V requests (default: 1). Reduce if hitting 429 rate limits.
+deapi_i2v_max_concurrent = 1
+
+# Clip relevance filtering threshold for stock footage search.
+# Options: "strict" (require 2+ matching content words), "balanced" (default, 1+),
+# "lenient" (accept any token match including low-info words).
+clip_relevance_threshold = "balanced"
 
 # -----------------------------------------------------------------------------
 # Storage and Task Runtime / 存储与任务运行

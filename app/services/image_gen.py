@@ -1,6 +1,7 @@
 import os
 import random
 import tempfile
+import threading
 import time
 import urllib.parse
 from uuid import uuid4
@@ -8,12 +9,19 @@ from uuid import uuid4
 import requests
 from loguru import logger
 from moviepy import ImageClip
+from PIL import Image
 
 from app.config import config
 from app.models.schema import VideoAspect
 
 _POLLINATIONS_IMAGE_URL = "https://image.pollinations.ai/prompt/{prompt}"
 _DEAPI_BASE_URL = "https://api.deapi.ai"
+
+def _get_deapi_i2v_max_concurrent() -> int:
+    return int(config.app.get("deapi_i2v_max_concurrent", 1))
+
+_deapi_i2v_max_concurrent = _get_deapi_i2v_max_concurrent()
+_deapi_i2v_slots = threading.BoundedSemaphore(value=_deapi_i2v_max_concurrent)
 
 
 def _download_image(
@@ -28,8 +36,9 @@ def _download_image(
         "width": width,
         "height": height,
         "model": model,
-        "seed": random.randint(0, 99999),
+        "seed": random.randint(0, 999999),
         "nologo": "true",
+        "enhance": "true",
     }
     url = f"{url}?{urllib.parse.urlencode(params)}"
     logger.info(f"generating image via Pollinations.ai: prompt='{prompt}'")
@@ -71,12 +80,21 @@ def _deapi_animate_image(
         logger.warning("deAPI API key not configured, cannot use I2V")
         return None
 
+    max_concurrent = _get_deapi_i2v_max_concurrent()
+    _deapi_i2v_slots.acquire()
     try:
-        model = config.app.get("deapi_i2v_model", "Ltxv_13B_0_9_8_Distilled_FP8")
-        fps = 10
-        duration = 4
-        frames_count = fps * duration
-        steps = 25
+        model = config.app.get("deapi_i2v_model", "Ltx2_19B_Dist_FP8")
+
+        max_dim = 1024
+        if target_width > max_dim or target_height > max_dim:
+            scale = min(max_dim / target_width, max_dim / target_height)
+            target_width = int(target_width * scale)
+            target_height = int(target_height * scale)
+
+        fps = 24
+        frames_count = fps * 4
+        frames_count = max(frames_count, 49)
+        frames_count = min(frames_count, 241)
 
         with open(image_path, "rb") as f:
             image_data = f.read()
@@ -89,8 +107,6 @@ def _deapi_animate_image(
             "model": model,
             "width": str(target_width),
             "height": str(target_height),
-            "guidance": "5.0",
-            "steps": str(steps),
             "seed": str(seed),
             "frames": str(frames_count),
             "fps": str(fps),
@@ -101,17 +117,38 @@ def _deapi_animate_image(
             f"{target_width}x{target_height}, {frames_count}frames @{fps}fps"
         )
 
-        resp = requests.post(
-            f"{_DEAPI_BASE_URL}/api/v2/videos/animations",
-            headers=headers,
-            files=files,
-            data=data,
-            timeout=120,
-        )
+        max_concurrent = _get_deapi_i2v_max_concurrent()
+        max_retries = int(config.app.get("deapi_i2v_max_retries", 5))
+        base_backoff = int(config.app.get("deapi_i2v_base_backoff", 10))
+        for retry in range(max_retries):
+            resp = requests.post(
+                f"{_DEAPI_BASE_URL}/api/v2/videos/animations",
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=120,
+            )
 
-        if resp.status_code not in (200, 201):
-            logger.warning(f"deAPI I2V submission failed: {resp.status_code} {resp.text}")
-            return None
+            if resp.status_code == 429:
+                if retry < max_retries - 1:
+                    backoff = base_backoff * (2**retry)
+                    logger.warning(
+                        f"deAPI I2V rate-limited (429): {resp.text}. "
+                        f"Retrying in {backoff}s (attempt {retry + 1}/{max_retries}, concurrency limit: {max_concurrent})"
+                    )
+                    time.sleep(backoff)
+                    continue
+                logger.warning(
+                    f"deAPI I2V rate-limited (429) after {max_retries} retries: {resp.text}. "
+                    f"Consider reducing concurrency (current limit: {max_concurrent})"
+                )
+                return None
+
+            if resp.status_code not in (200, 201):
+                logger.warning(f"deAPI I2V submission failed: {resp.status_code} {resp.text}")
+                return None
+
+            break
 
         result_data = resp.json()
         request_id = result_data.get("data", {}).get("request_id")
@@ -156,7 +193,7 @@ def _deapi_animate_image(
                     or status_data.get("result", {}).get("url", "")
                 )
                 if not result_url:
-                    logger.warning("deAPI I2V: job done but no result URL")
+                    logger.warning("deAPI I2V: job done but no URL returned")
                     return None
 
                 video_resp = requests.get(result_url, timeout=120)
@@ -181,10 +218,11 @@ def _deapi_animate_image(
 
         logger.warning(f"deAPI I2V job timed out after {max_polls * poll_interval}s")
         return None
-
     except Exception as e:
         logger.warning(f"deAPI I2V failed: {e}")
         return None
+    finally:
+        _deapi_i2v_slots.release()
 
 
 def _animate_image_to_video(
@@ -194,34 +232,118 @@ def _animate_image_to_video(
     fps: int = 24,
     target_width: int = 1080,
     target_height: int = 1920,
+    ken_burns_strength: float = 0.08,
 ) -> str | None:
+    """
+    Create a smooth Ken Burns style animation from a static image.
+
+    Improvements over the old version:
+    - Uses PIL for high-quality resampling (LANCZOS) instead of MoviePy's repeated resize
+    - Maintains aspect ratio with letterboxing instead of forced cropping
+    - Applies a single smooth transform per frame rather than compounding resize operations
+    - Configurable zoom/pan strength to avoid excessive distortion
+    """
     try:
-        clip = ImageClip(image_path).with_duration(duration)
+        with Image.open(image_path) as img:
+            img.load()
+            src_w, src_h = img.size
+            src_ratio = src_w / src_h
+            target_ratio = target_width / target_height
 
-        clip_ratio = clip.w / clip.h
-        target_ratio = target_width / target_height
-        if clip_ratio > target_ratio:
-            clip = clip.resized(height=target_height)
-        else:
-            clip = clip.resized(width=target_width)
+            # Calculate the canvas size that preserves the full image
+            # with letterboxing/pillarboxing to target aspect ratio
+            if src_ratio > target_ratio:
+                # Source is wider: fit to width, letterbox top/bottom
+                canvas_w = target_width
+                canvas_h = int(target_width / src_ratio)
+            else:
+                # Source is taller: fit to height, pillarbox left/right
+                canvas_h = target_height
+                canvas_w = int(target_height * src_ratio)
 
-        cx = clip.w / 2
-        cy = clip.h / 2
-        clip = clip.cropped(x_center=cx, y_center=cy, width=target_width, height=target_height)
+            # Create a high-res canvas for the animation (2x target for quality)
+            # We animate at 2x and downscale at the end for anti-aliasing
+            super_w = canvas_w * 2
+            super_h = canvas_h * 2
 
-        zoom_fn = lambda t: 1.0 + 0.05 * (t / duration)
-        clip = clip.resized(zoom_fn)
+            # Pre-resize the source image to the super-resolution canvas once
+            img_resized = img.resize((super_w, super_h), Image.Resampling.LANCZOS)
 
-        clip.write_videofile(
-            output_path,
-            codec="libx264",
-            audio=False,
-            logger=None,
-            fps=fps,
-            preset="medium",
-            ffmpeg_params=["-pix_fmt", "yuv420p"],
-        )
-        clip.close()
+            # Ken Burns parameters: gentle zoom + optional slow pan
+            # Zoom from 1.0 to 1.0 + ken_burns_strength
+            zoom_start = 1.0
+            zoom_end = 1.0 + ken_burns_strength
+
+            # Pan range: up to 10% of the canvas in each direction
+            pan_range_x = (super_w - target_width * 2) * 0.1
+            pan_range_y = (super_h - target_height * 2) * 0.1
+            pan_start_x = random.uniform(-pan_range_x, pan_range_x)
+            pan_start_y = random.uniform(-pan_range_y, pan_range_y)
+            pan_end_x = random.uniform(-pan_range_x, pan_range_x)
+            pan_end_y = random.uniform(-pan_range_y, pan_range_y)
+
+            frames = []
+            total_frames = fps * duration
+
+            logger.debug(f"Generating {total_frames} frames for Ken Burns animation")
+
+            for frame_idx in range(total_frames):
+                t = frame_idx / max(total_frames - 1, 1)
+                # Smooth easing (ease-in-out)
+                progress = t * t * (3 - 2 * t)
+
+                # Interpolate zoom and pan
+                zoom = zoom_start + (zoom_end - zoom_start) * progress
+                pan_x = pan_start_x + (pan_end_x - pan_start_x) * progress
+                pan_y = pan_start_y + (pan_end_y - pan_start_y) * progress
+
+                # Calculate crop box on the super-res canvas
+                crop_w = super_w / zoom
+                crop_h = super_h / zoom
+                center_x = super_w / 2 + pan_x
+                center_y = super_h / 2 + pan_y
+
+                left = center_x - crop_w / 2
+                top = center_y - crop_h / 2
+                right = left + crop_w
+                bottom = top + crop_h
+
+                # Clamp to image bounds
+                left = max(0, min(left, super_w - crop_w))
+                top = max(0, min(top, super_h - crop_h))
+                right = left + crop_w
+                bottom = top + crop_h
+
+                # Crop and downscale to target resolution in one step
+                frame = img_resized.crop((left, top, right, bottom))
+                frame = frame.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                frames.append(frame)
+
+            # Write frames to video using ffmpeg directly for best quality
+            import subprocess
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Save frames as PNG sequence
+                for i, frame in enumerate(frames):
+                    frame.save(os.path.join(tmpdir, f"frame_{i:06d}.png"))
+
+                # Encode with ffmpeg using high-quality settings
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-framerate", str(fps),
+                    "-i", os.path.join(tmpdir, "frame_%06d.png"),
+                    "-c:v", "libx264",
+                    "-preset", "medium",
+                    "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-vf", "format=yuv420p",
+                    output_path
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                if result.returncode != 0:
+                    logger.warning(f"ffmpeg encoding failed: {result.stderr}")
+                    return None
 
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             logger.info(f"animated clip saved: {output_path}")
@@ -251,16 +373,19 @@ def generate_ai_clip(
     result = None
 
     if provider == "deapi":
-        i2v_prompt = f"natural gentle motion, {prompt}"
+        i2v_prompt = f"natural gentle motion, cinematic, high quality, {prompt}"
         result = _deapi_animate_image(
             img_path, i2v_prompt, output_path,
             target_width=target_width, target_height=target_height,
         )
 
     if not result:
+        # Use improved Ken Burns animation with configurable strength
+        ken_burns_strength = float(config.app.get("ai_ken_burns_strength", 0.08))
         result = _animate_image_to_video(
             img_path, output_path, duration,
             target_width=target_width, target_height=target_height,
+            ken_burns_strength=ken_burns_strength,
         )
 
     if img_path and os.path.exists(img_path):

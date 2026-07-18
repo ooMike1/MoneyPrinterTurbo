@@ -587,12 +587,6 @@ def generate_paragraph_terms(
     paragraphs: List[str],
     terms_per_paragraph: int = 2,
 ) -> List[List[str]]:
-    """
-    Generate specific visual search terms for EACH paragraph of the script.
-
-    Returns a list of lists: for each paragraph, a list of search terms.
-    Each term describes a concrete visual scene that matches the paragraph's topic.
-    """
     logger.info(
         f"generating per-paragraph terms: subject={video_subject}, "
         f"paragraphs={len(paragraphs)}, terms_per_paragraph={terms_per_paragraph}"
@@ -663,6 +657,95 @@ that matches the following paragraph from a video script.
     successful = sum(1 for t in result if t)
     logger.success(
         f"generated per-paragraph terms for {successful}/{len(paragraphs)} paragraphs"
+    )
+    return result
+
+
+def generate_sentence_terms(
+    video_subject: str,
+    sentences: List[str],
+    terms_per_sentence: int = 2,
+) -> List[List[str]]:
+    """
+    Generate specific visual search terms for EACH sentence of the script.
+
+    Returns a list of lists: for each sentence, a list of search terms.
+    Each term describes a concrete visual scene matching the sentence's content.
+    """
+    logger.info(
+        f"generating per-sentence terms: subject={video_subject}, "
+        f"sentences={len(sentences)}, terms_per_sentence={terms_per_sentence}"
+    )
+    result: List[List[str]] = []
+
+    for sent_idx, sentence in enumerate(sentences):
+        sentence = sentence.strip()
+        if not sentence:
+            result.append([])
+            continue
+
+        prompt = f"""
+# Role: Video Scene Term Generator
+
+## Goal
+Generate {terms_per_sentence} short visual search terms for stock video footage
+that matches the following sentence from a video script.
+
+## Constraints
+1. Return ONLY a JSON array of strings, no other text.
+2. Each term must describe a concrete, searchable visual scene (2-5 words).
+3. Terms must be visually distinct from each other.
+4. Include shot type hints: "close up", "wide shot", "aerial view", "dolly shot", etc.
+5. Use English only.
+6. Focus on SPECIFIC visual entities and actions mentioned in the sentence.
+
+## Video Subject
+{video_subject}
+
+## Script Sentence ({sent_idx + 1} of {len(sentences)})
+{sentence}
+
+## Output Example
+["close up doctor using digital tablet", "wide shot hospital corridor with medical staff"]
+""".strip()
+
+        terms: List[str] = []
+        response = ""
+        for i in range(_max_retries):
+            try:
+                response = _generate_response(prompt)
+                if response.startswith("Error: "):
+                    logger.error(f"failed to generate sentence terms: {response}")
+                    break
+                terms = json.loads(_strip_code_fence(response))
+                if isinstance(terms, list) and all(isinstance(t, str) for t in terms):
+                    break
+            except Exception as e:
+                logger.warning(
+                    f"failed to generate terms for sentence {sent_idx + 1}: {e}"
+                )
+                if response:
+                    match = re.search(r"\[.*\]", response, re.DOTALL)
+                    if match:
+                        try:
+                            terms = json.loads(match.group())
+                        except Exception:
+                            pass
+
+        if terms and len(terms) > 0:
+            result.append(terms)
+            logger.debug(
+                f"sentence {sent_idx + 1}: {len(terms)} terms: {terms[:3]}"
+            )
+        else:
+            # Fallback: use first meaningful phrase from sentence
+            words = sentence.split()
+            fallback = " ".join(words[:8])
+            result.append([fallback])
+
+    successful = sum(1 for t in result if t)
+    logger.success(
+        f"generated per-sentence terms for {successful}/{len(sentences)} sentences"
     )
     return result
 
